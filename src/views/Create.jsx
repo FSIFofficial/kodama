@@ -579,8 +579,21 @@ function StepDetails({ form, values, org, orgValues, setOrgValues, caseValues, s
                 <ItemInput item={i} value={caseValues[i.key]} onInput={(v) => setCaseValues({ ...caseValues, [i.key]: v })} />
               </Label>
             ))}
-            {!form.caseItems.length && <p class="text-sm text-slate-500">入力が必要な案件項目はありません。</p>}
+            {!form.caseItems.length && !form.freeItems.length && <p class="text-sm text-slate-500">入力が必要な案件項目はありません。</p>}
           </div>
+          {form.freeItems.length > 0 && (
+            <div class="mt-6 border-t border-[#edf1f7] pt-5">
+              <p class="text-sm font-semibold">自由記述</p>
+              <p class="mt-1 text-xs text-slate-500">テンプレートの「自由記述」の場所に、この資料だけの文章を書きます。空欄なら、その行は出力されません。</p>
+              <div class="mt-3 grid gap-4">
+                {form.freeItems.map((i) => (
+                  <Label key={i.key} label={i.label}>
+                    <ItemInput item={i} value={caseValues[i.key]} onInput={(v) => setCaseValues({ ...caseValues, [i.key]: v })} />
+                  </Label>
+                ))}
+              </div>
+            </div>
+          )}
           {form.settingKeys.length > 0 && <p class="mt-5 text-xs text-slate-400">共通設定から自動で入る項目：{form.settingKeys.join('、')}</p>}
         </div>
 
