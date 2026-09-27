@@ -156,3 +156,18 @@ test('共通パーツ：{{部品:名前}} を展開し、中の差し込みも�
   // 書類：雛形の {{部品:名前}} を差し込み済みの内容に置き換える
   assert.deepEqual(fileReplacements('{{部品:連絡先}}', ctx).replacements, { '{{部品:連絡先}}': '担当：山田' })
 })
+
+test('自由記述：{{自由:見出し}} は項目に登録せず、資料ごとに入力した文を差し込む', async () => {
+  const { buildContext, fileReplacements, formItemsFor, renderSegments, renderTemplate } = await import('../src/lib/engine.js')
+  const items = [{ key: '団体名', category: '団体', order: 1 }]
+  const tpl = '{{団体名}} 様\n{{自由:ひとこと}}\n今回のポイント：{{自由}}\n締め'
+  const form = formItemsFor({ picked: { M1: { fields: { 本文: tpl } } }, mediaIds: ['M1'], items, settings: [] })
+  assert.deepEqual(form.freeItems.map((i) => [i.key, i.label]), [['自由:ひとこと', 'ひとこと'], ['自由:自由記述', '自由記述']])
+  assert.deepEqual(form.unknownKeys, [])
+  let ctx = buildContext({ values: { 団体名: 'A', '自由:ひとこと': '2026-09-24 に会いました' }, items, settings: [] })
+  // 日付のように見えても書式を当てない。未入力の自由記述の行は消える
+  assert.equal(renderTemplate(tpl, ctx), 'A 様\n2026-09-24 に会いました\n締め')
+  assert.ok(renderSegments('{{自由:ひとこと}}', buildContext({ values: {}, items, settings: [] })).some((s) => s.missing && s.text === '［ひとこと］'))
+  ctx = buildContext({ values: { '自由:自由記述': 'x' }, items, settings: [] })
+  assert.deepEqual(fileReplacements('{{自由}}', ctx).replacements, { '{{自由}}': 'x' })
+})

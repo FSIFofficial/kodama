@@ -40,6 +40,13 @@ export function unknownParts(texts, parts = {}) {
   return names
 }
 
+// 自由記述：{{自由:見出し}} は入力項目に登録しなくても、資料を作るときにその見出しの入力欄が出る（団体ごとに変えたい一文などに使う）。
+// {{自由}} だけなら見出しは「自由記述」。入力値は values['自由:見出し'] に入る
+export const FREE_KEY = '自由'
+export const FREE_DEFAULT_LABEL = '自由記述'
+export const freeLabel = (format) => String(format || '').trim() || FREE_DEFAULT_LABEL
+export const freeValueKey = (format) => `${FREE_KEY}:${freeLabel(format)}`
+
 // Google ドライブの URL でも ID でも受け付けて ID を返す
 export function driveIdFrom(input) {
   const s = String(input || '').trim()
@@ -94,6 +101,10 @@ export function formatDate(value, format = DEFAULT_DATE_FORMAT) {
 
 // items: { [項目キー]: 入力項目 }, settings: { [項目キー]: 値 }
 export function resolveValue(key, format, { values = {}, items = {}, settings = {} }) {
+  if (key === FREE_KEY) {
+    const v = values[freeValueKey(format)]
+    return v === undefined || v === null || v === '' ? null : String(v)
+  }
   const item = items[key]
   let v = values[key]
   if ((v === undefined || v === null || v === '') && !item && key in settings) v = settings[key]
@@ -112,7 +123,8 @@ export function renderSegments(template, ctx) {
   for (const p of extractPlaceholders(text)) {
     if (p.start > last) segments.push({ text: text.slice(last, p.start) })
     const v = resolveValue(p.key, p.format, ctx)
-    segments.push(v === null ? { text: `［${p.key}］`, key: p.key, missing: true } : { text: v, key: p.key })
+    const label = p.key === FREE_KEY ? freeLabel(p.format) : p.key
+    segments.push(v === null ? { text: `［${label}］`, key: p.key, missing: true } : { text: v, key: p.key })
     last = p.end
   }
   if (last < text.length) segments.push({ text: text.slice(last) })
@@ -316,7 +328,16 @@ export function formItemsFor({ picked, mediaIds, items, settings, parts = [] }) 
   const map = partsMap(parts)
   const raw = mediaIds.flatMap((id) => Object.values(picked[id]?.fields || {}))
   const texts = raw.map((t) => expandParts(t, map))
-  const keys = extractKeys(texts).filter((k) => k !== PART_KEY)
+  const keys = extractKeys(texts).filter((k) => k !== PART_KEY && k !== FREE_KEY)
+  // 自由記述の見出し（出てきた順・重複なし）。入力フォームでは長文の欄として出す
+  const freeItems = []
+  for (const text of texts) {
+    for (const p of extractPlaceholders(text)) {
+      if (p.key !== FREE_KEY) continue
+      const key = freeValueKey(p.format)
+      if (!freeItems.some((i) => i.key === key)) freeItems.push({ key, label: freeLabel(p.format), type: '長文', category: '案件', free: true, required: false, defaultValue: '', example: '' })
+    }
+  }
   const byKey = Object.fromEntries(items.map((i) => [i.key, i]))
   const settingKeys = new Set(settings.map((s) => s.key))
   const used = keys.filter((k) => byKey[k]).map((k) => byKey[k]).sort((a, b) => (a.order === '' ? Infinity : a.order) - (b.order === '' ? Infinity : b.order))
@@ -327,6 +348,7 @@ export function formItemsFor({ picked, mediaIds, items, settings, parts = [] }) 
     unknownKeys: keys.filter((k) => !byKey[k] && !settingKeys.has(k) && k !== LOGO_KEY),
     usesLogo: keys.includes(LOGO_KEY),
     unknownParts: unknownParts(raw, map),
+    freeItems,
   }
 }
 

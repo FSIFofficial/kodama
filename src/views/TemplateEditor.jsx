@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { ArrowLeft, Calendar, FileText, History as HistoryIcon, Plus, Save, Scissors } from 'lucide-preact'
-import { COMMON_RANK, DOCUMENT_FORMATS, IMAGE_FORMAT, LOGO_KEY, PART_KEY, buildContext, partsMap, unknownParts, driveIdFrom, countText, extractKeys, formatDate, mockValues, placeholderAt, renderSegments, splitXThread } from '../lib/engine.js'
+import { COMMON_RANK, DOCUMENT_FORMATS, FREE_KEY, IMAGE_FORMAT, LOGO_KEY, PART_KEY, buildContext, extractPlaceholders, freeLabel, partsMap, unknownParts, driveIdFrom, countText, extractKeys, formatDate, mockValues, placeholderAt, renderSegments, splitXThread } from '../lib/engine.js'
 import { Alert, Badge, Button, DocLink, Eyebrow, Label, Modal, Spinner, activeOnly, card, copyText, cx, formatDateTime, inputCls, useApp } from '../ui/ui.jsx'
 import { lineDiff } from '../lib/diff.js'
 import { Segments } from './Create.jsx'
@@ -45,6 +45,7 @@ export function TemplateEditor({ mode, template, onClose }) {
   const [unknownPrompt, setUnknownPrompt] = useState(null)
   const [quickCreate, setQuickCreate] = useState(null) // 'sets' | 'media' | 'ranks'
   const [showRevisions, setShowRevisions] = useState(false)
+  const [freePrompt, setFreePrompt] = useState(false)
   const [busy, setBusy] = useState(false)
   const refs = useRef({})
   const pendingCaret = useRef(null)
@@ -137,7 +138,9 @@ export function TemplateEditor({ mode, template, onClose }) {
   }
 
   const usedKeys = extractKeys(Object.values(fields))
-  const unknownKeys = usedKeys.filter((k) => !itemsByKey[k] && !settingKeys.includes(k) && k !== LOGO_KEY && k !== PART_KEY)
+  const unknownKeys = usedKeys.filter((k) => !itemsByKey[k] && !settingKeys.includes(k) && k !== LOGO_KEY && k !== PART_KEY && k !== FREE_KEY)
+  // テンプレートで使っている自由記述の見出し
+  const usedFree = [...new Set(Object.values(fields).flatMap((t) => extractPlaceholders(t).filter((p) => p.key === FREE_KEY).map((p) => freeLabel(p.format))))]
   const missingParts = unknownParts(Object.values(fields), partsMap(data.parts))
   const usedParts = [...Object.values(fields).join('\n').matchAll(/\{\{\s*部品\s*:\s*([^{}]+?)\s*\}\}/g)].map((m) => m[1])
 
@@ -337,7 +340,22 @@ export function TemplateEditor({ mode, template, onClose }) {
                     {p.name}
                   </button>
                 ))}
-                {!activeOnly(data.parts).length && <span class="text-xs text-slate-400">管理画面の「共通パーツ」で登録すると、ここから差し込めます。</span>}
+                <button onClick={() => setQuickCreate('parts')} class="inline-flex items-center gap-1 rounded-lg border border-dashed border-[#9fc3e8] bg-[#f1f8ff] px-2.5 py-1 text-xs font-medium text-[#1261af] hover:border-[#3b8dd9]">
+                  <Plus class="size-3" />新しく作る
+                </button>
+              </div>
+            </div>
+            <div class="mt-4">
+              <p class="text-xs font-bold text-slate-400">自由記述 <span class="font-normal">（項目に登録せず、資料を作るたびに団体ごとの文章を書く場所）</span></p>
+              <div class="mt-2 flex flex-wrap gap-1.5">
+                {usedFree.map((label) => (
+                  <button key={label} onClick={() => insert(label === '自由記述' ? `{{${FREE_KEY}}}` : `{{${FREE_KEY}:${label}}}`)} class="rounded-lg border border-[#9bdcc5] bg-[#effcf6] px-2.5 py-1 text-xs font-medium text-[#17634f]">
+                    {label}
+                  </button>
+                ))}
+                <button onClick={() => setFreePrompt(true)} class="inline-flex items-center gap-1 rounded-lg border border-dashed border-[#9fc3e8] bg-[#f1f8ff] px-2.5 py-1 text-xs font-medium text-[#1261af] hover:border-[#3b8dd9]">
+                  <Plus class="size-3" />自由記述を入れる
+                </button>
               </div>
             </div>
           </div>
@@ -406,8 +424,19 @@ export function TemplateEditor({ mode, template, onClose }) {
           fileFormat={isDocument}
           onClose={() => setQuickCreate(null)}
           onCreated={(key) => {
-            setMeta({ ...meta, [{ sets: 'setId', media: 'mediaId', ranks: 'rank' }[quickCreate]]: key })
+            if (quickCreate === 'parts') insert(`{{${PART_KEY}:${key}}}`)
+            else setMeta({ ...meta, [{ sets: 'setId', media: 'mediaId', ranks: 'rank' }[quickCreate]]: key })
             setQuickCreate(null)
+          }}
+        />
+      )}
+
+      {freePrompt && (
+        <FreeTextModal
+          onClose={() => setFreePrompt(false)}
+          onInsert={(label) => {
+            insert(label ? `{{${FREE_KEY}:${label}}}` : `{{${FREE_KEY}}}`)
+            setFreePrompt(false)
           }}
         />
       )}
@@ -532,10 +561,11 @@ function QuickCreateModal({ kind, fileFormat, onClose, onCreated }) {
   const { api, data, reload, notify } = useApp()
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [content, setContent] = useState('')
   const [preset, setPreset] = useState(0)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const title = { sets: '新しいセット', media: '新しい媒体', ranks: '新しいランク' }[kind]
+  const title = { sets: '新しいセット', media: '新しい媒体', ranks: '新しいランク', parts: '新しい共通パーツ' }[kind]
   const nextOrder = (list) => Math.max(0, ...list.map((x) => Number(x.order) || 0)) + 1
 
   const save = async () => {
@@ -545,6 +575,7 @@ function QuickCreateModal({ kind, fileFormat, onClose, onCreated }) {
       let payload
       if (kind === 'sets') payload = { entity: 'sets', data: { name, description, order: nextOrder(data.sets) } }
       else if (kind === 'ranks') payload = { entity: 'ranks', data: { name, order: nextOrder(data.ranks) } }
+      else if (kind === 'parts') payload = { entity: 'parts', data: { name, content, description, order: nextOrder(data.parts || []) } }
       else {
         // 書類・告知画像の媒体は「本文」欄ひとつ（雛形の内容を写す欄）
         const fields = fileFormat ? [{ fieldKey: '本文', label: '内容' }] : MEDIA_PRESETS[preset].fields
@@ -568,14 +599,24 @@ function QuickCreateModal({ kind, fileFormat, onClose, onCreated }) {
       footer={
         <>
           <Button variant="outline" onClick={onClose}>キャンセル</Button>
-          <Button icon={busy ? Spinner : Plus} onClick={save} disabled={busy || !name.trim()}>追加して選ぶ</Button>
+          <Button icon={busy ? Spinner : Plus} onClick={save} disabled={busy || !name.trim()}>{kind === 'parts' ? '追加して差し込む' : '追加して選ぶ'}</Button>
         </>
       }
     >
       <div class="grid gap-4">
-        <Label label={{ sets: 'セット名', media: '媒体名', ranks: 'ランク名' }[kind]} required hint={kind === 'ranks' ? `登録後は変更できません。「${COMMON_RANK}」は使えません。` : ''}>
-          <input value={name} onInput={(e) => setName(e.currentTarget.value)} class={inputCls} placeholder={{ sets: '例：Orbit利用開始セット', media: '例：告知画像', ranks: '例：プラチナ' }[kind]} />
+        <Label label={{ sets: 'セット名', media: '媒体名', ranks: 'ランク名', parts: 'パーツ名' }[kind]} required hint={kind === 'ranks' ? `登録後は変更できません。「${COMMON_RANK}」は使えません。` : kind === 'parts' ? '{{部品:パーツ名}} として差し込まれます。登録後は名前を変えられません。' : ''}>
+          <input value={name} onInput={(e) => setName(e.currentTarget.value)} class={inputCls} placeholder={{ sets: '例：Orbit利用開始セット', media: '例：告知画像', ranks: '例：プラチナ', parts: '例：署名ブロック' }[kind]} />
         </Label>
+        {kind === 'parts' && (
+          <>
+            <Label label="内容" hint="{{団体名}} や {{署名}} などの差し込みも書けます。あとから直すと、このパーツを使うすべてのテンプレートに反映されます（管理者）。">
+              <textarea value={content} onInput={(e) => setContent(e.currentTarget.value)} class={cx(inputCls, 'h-32 py-2')} aria-label="パーツの内容" />
+            </Label>
+            <Label label="説明">
+              <input value={description} onInput={(e) => setDescription(e.currentTarget.value)} class={inputCls} />
+            </Label>
+          </>
+        )}
         {kind === 'sets' && (
           <Label label="説明">
             <input value={description} onInput={(e) => setDescription(e.currentTarget.value)} class={inputCls} />
@@ -592,6 +633,32 @@ function QuickCreateModal({ kind, fileFormat, onClose, onCreated }) {
             </Label>
           ))}
         {error && <Alert tone="red">{error}</Alert>}
+      </div>
+    </Modal>
+  )
+}
+
+// 自由記述を入れる：見出し（資料を作る画面の入力欄の名前）を決めて {{自由:見出し}} を差し込む
+function FreeTextModal({ onClose, onInsert }) {
+  const [label, setLabel] = useState('')
+  const invalid = /[{}:\n]/.test(label)
+  return (
+    <Modal
+      title="自由記述を入れる"
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>キャンセル</Button>
+          <Button icon={Plus} onClick={() => onInsert(label.trim())} disabled={invalid}>差し込む</Button>
+        </>
+      }
+    >
+      <div class="grid gap-3">
+        <p class="text-sm text-slate-600">入力項目に登録しなくても、資料を作るときにこの場所の文章を書く欄が出ます。団体ごとに変えたい一文（ひとこと、特記事項など）に使います。</p>
+        <Label label="見出し" hint="資料を作る画面で入力欄の名前になります。同じテンプレートに複数入れるときは見出しを変えてください。空欄なら「自由記述」。">
+          <input value={label} onInput={(e) => setLabel(e.currentTarget.value)} class={inputCls} placeholder="例：先方へのひとこと" aria-label="自由記述の見出し" />
+        </Label>
+        {invalid && <p class="text-sm text-red-600">見出しに { } : や改行は使えません。</p>}
       </div>
     </Modal>
   )

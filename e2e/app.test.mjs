@@ -267,3 +267,32 @@ test('コピー形式「CSV行」：欄を1行の CSV にしてコピーでき�
   assert.deepEqual(app.errors, [])
   await app.close()
 })
+
+test('自由記述と、テンプレート編集からの共通パーツ作成', async () => {
+  const app = await open()
+  const { page, nav, toast } = app
+  await nav('管理')
+  await page.getByRole('button', { name: '新規追加' }).click()
+  await page.locator('label', { hasText: 'テンプレ名' }).locator('input').fill('自由記述テスト')
+  const body = page.locator('main textarea').last()
+  await body.fill('{{団体名}} 様\n')
+  // 自由記述を入れる
+  await page.getByRole('button', { name: '自由記述を入れる' }).click()
+  await page.getByLabel('自由記述の見出し').fill('先方へのひとこと')
+  await page.getByRole('button', { name: '差し込む' }).click()
+  assert.match(await body.inputValue(), /\{\{自由:先方へのひとこと\}\}/)
+  // 共通パーツをその場で作って差し込む
+  await page.getByRole('button', { name: '新しく作る', exact: true }).click()
+  await page.getByPlaceholder('例：署名ブロック').fill('結びの挨拶')
+  await page.getByLabel('パーツの内容').fill('今後ともよろしくお願いいたします。')
+  await page.getByRole('button', { name: '追加して差し込む' }).click()
+  await toast('追加しました')
+  assert.match(await body.inputValue(), /\{\{部品:結びの挨拶\}\}/)
+  await page.getByRole('button', { name: '追加', exact: true }).click()
+  await toast('テンプレートを追加しました')
+  // 共通パーツの一覧にも出る
+  await page.getByRole('button', { name: /^共通パーツ/ }).click()
+  await page.getByText('結びの挨拶').first().waitFor()
+  assert.deepEqual(app.errors, [])
+  await app.close()
+})
