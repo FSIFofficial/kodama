@@ -1,9 +1,10 @@
 import { render } from 'preact'
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
-import { BookOpen, Check, History as HistoryIcon, Home as HomeIcon, Plus, RefreshCw, Settings, ShieldCheck, X } from 'lucide-preact'
+import { BookOpen, Check, History as HistoryIcon, Home as HomeIcon, LogOut, Plus, RefreshCw, Settings, ShieldCheck, X } from 'lucide-preact'
 import { checkInitData, createApi } from './lib/api.js'
+import { createGoogleAuth } from './lib/google-auth.js'
 import { resetMockData } from './lib/mock-backend.js'
-import { AppContext, Alert, Button, Label, Modal, Spinner, cx, inputCls } from './ui/ui.jsx'
+import { AppContext, Alert, Button, Spinner, cx } from './ui/ui.jsx'
 import { Home } from './views/Home.jsx'
 import { Create } from './views/Create.jsx'
 import { HistoryView } from './views/History.jsx'
@@ -11,18 +12,30 @@ import { Admin } from './views/Admin.jsx'
 import { Usage } from './views/Guide.jsx'
 
 const config = window.APP_CONFIG || { mock: true }
-const api = createApi(config)
+
+// ログイン（Google。モックモードでは利用者・管理者を選ぶ）。トークンが変わったら App に知らせる
+let onTokenChange = () => {}
+const auth = createGoogleAuth({ clientId: config.googleClientId, mock: Boolean(config.mock), onChange: (t) => onTokenChange(t) })
+const api = createApi(config, { getIdToken: () => auth.token, onAuthError: () => auth.expire() })
 
 function App() {
+  const [token, setToken] = useState(auth.token)
+  // ログインしている人 { email, name, role }。権限は GAS が Access Manager に問い合わせて決める
+  const [me, setMe] = useState(null)
+  const [authError, setAuthError] = useState('')
   const [data, setData] = useState(null)
   const [loadError, setLoadError] = useState('')
   const [view, setView] = useState('home')
   const [seed, setSeed] = useState({ id: 0 })
   const [toast, setToast] = useState(null)
-  const [adminPrompt, setAdminPrompt] = useState(null)
-  const [isAdmin, setIsAdmin] = useState(api.hasAdmin())
   const [history, setHistory] = useState(null)
   const toastTimer = useRef(null)
+  const isAdmin = me?.role === 'admin'
+
+  useEffect(() => {
+    onTokenChange = setToken
+    auth.start().catch((e) => setAuthError(e.message))
+  }, [])
 
   const notify = useCallback((message, tone = 'ok') => {
     clearTimeout(toastTimer.current)
@@ -49,27 +62,53 @@ function App() {
     return list
   }, [])
 
+  // ログインしたら、だれか（権限）を確かめてからデータを読む。ログアウト・失効したら画面のデータも消す
   useEffect(() => {
-    reload().catch((e) => setLoadError(e.message))
-    loadHistory().catch(() => setHistory([]))
-  }, [])
-
-  // 管理者パスを要求する。すでに入力済みならそのまま通す
-  const requireAdmin = useCallback(() => {
-    if (api.hasAdmin()) return Promise.resolve(true)
-    return new Promise((resolve) => setAdminPrompt({ resolve }))
-  }, [])
-
-  // 管理者操作の共通処理：パス確認 → 実行 → パス誤りなら再入力を促す
-  const adminCall = useCallback(async (action, payload) => {
-    if (!(await requireAdmin())) return null
-    try {
-      return await api.call(action, payload, { admin: true })
-    } catch (e) {
-      if (e.code === 'ADMIN_REQUIRED') setIsAdmin(false)
-      throw e
+    if (!token) {
+      // ログアウト・失効したら、次にログインする人のためにホームに戻す
+      setMe(null)
+      setData(null)
+      setHistory(null)
+      setView('home')
+      return
     }
-  }, [])
+    let alive = true
+    setAuthError('')
+    setLoadError('')
+    api
+      .whoami()
+      .then((who) => {
+        if (!alive) return
+        setMe(who)
+        reload().catch((e) => setLoadError(e.message))
+        loadHistory().catch(() => setHistory([]))
+      })
+      .catch((e) => {
+        if (!alive) return
+        setAuthError(e.message)
+        // 使えないアカウントなら、別のアカウントでログインし直せるようにする
+        if (e.code === 'NOT_ALLOWED') auth.signOut()
+      })
+    return () => {
+      alive = false
+    }
+  }, [token])
+
+  // 管理者でなければ知らせて止める（権限は Access Manager で付ける）
+  const requireAdmin = useCallback(() => {
+    if (isAdmin) return Promise.resolve(true)
+    notify('この操作には kodama の「管理者」の権限が必要です（FSIF の Access Manager で付けてもらってください）', 'error')
+    return Promise.resolve(false)
+  }, [isAdmin])
+
+  // 管理者操作の共通処理
+  const adminCall = useCallback(
+    async (action, payload) => {
+      if (!(await requireAdmin())) return null
+      return api.call(action, payload)
+    },
+    [requireAdmin],
+  )
 
   // スプレッドシートの内容を読み込み直して最新にする（ページの再読み込みは不要）。
   // ボタンから押したときは結果を知らせ、ページ移動やタブに戻ったときは裏で静かに行う
@@ -108,7 +147,9 @@ function App() {
     go('create')
   }
 
-  const ctx = { api, data, reload, notify, requireAdmin, adminCall, isAdmin, history, loadHistory, setHistory, startCreate, setView: go, refreshing }
+  const ctx = { api, me, data, reload, notify, requireAdmin, adminCall, isAdmin, history, loadHistory, setHistory, startCreate, setView: go, refreshing }
+
+  if (!token || !me) return <LoginScreen error={authError} checking={Boolean(token) && !authError} />
 
   const nav = [
     ['home', 'ホーム', HomeIcon, () => go('home')],
@@ -143,20 +184,25 @@ function App() {
                   <span class="hidden md:inline">{refreshing ? '更新中…' : '最新に更新'}</span>
                 </button>
               )}
-              {isAdmin && (
-                <button
-                  onClick={() => {
-                    api.setAdminPass('')
-                    setIsAdmin(false)
-                    notify('管理者モードを終了しました')
-                  }}
-                  title="クリックで管理者モードを終了"
-                  class="hidden items-center gap-1 rounded-full bg-[#effcf6] px-3 py-1.5 text-xs font-bold text-[#17634f] sm:flex"
-                >
-                  <ShieldCheck class="size-3.5" />
-                  管理者モード
-                </button>
-              )}
+              <span class="hidden items-center gap-1.5 text-xs text-slate-500 lg:flex" title={me.email}>
+                <span class="max-w-40 truncate font-medium text-slate-700">{me.name}</span>
+                {isAdmin ? (
+                  <span class="flex items-center gap-1 rounded-full bg-[#effcf6] px-2 py-0.5 font-bold text-[#17634f]">
+                    <ShieldCheck class="size-3.5" />
+                    管理者
+                  </span>
+                ) : (
+                  <span class="rounded-full bg-[#f3f6fb] px-2 py-0.5">利用者</span>
+                )}
+              </span>
+              <button
+                onClick={() => auth.signOut()}
+                title="ログアウト"
+                aria-label="ログアウト"
+                class="flex items-center gap-1 rounded-xl px-2 py-2 text-sm text-slate-500 hover:bg-[#f3f6fb] hover:text-slate-700"
+              >
+                <LogOut class="size-4" />
+              </button>
               <nav class="flex items-center gap-1 rounded-xl bg-[#f3f6fb] p-1 text-sm font-medium">
                 {nav.map(([key, label, Icon, onClick]) => (
                   <button key={key} onClick={onClick} aria-label={label} class={cx('flex items-center gap-1 rounded-lg px-3 py-2', view === key ? 'bg-white text-[#1261af] shadow-sm' : 'text-slate-500 hover:text-slate-700')}>
@@ -198,7 +244,7 @@ function App() {
         <footer class="mx-auto flex max-w-[1440px] flex-wrap items-center gap-3 px-5 pb-8 text-xs text-slate-400 lg:px-10">
           {api.mock ? (
             <>
-              <span>モックモード｜データはこのブラウザにのみ保存されます（管理者パス：{api.mockAdminPassword}）</span>
+              <span>モックモード｜データはこのブラウザにのみ保存されます</span>
               <button
                 class="underline"
                 onClick={() => {
@@ -212,7 +258,7 @@ function App() {
               </button>
             </>
           ) : (
-            <span>データは管理用スプレッドシートに保存されます。</span>
+            <span>データは管理用スプレッドシートに保存されます。使える人と管理者は FSIF の Access Manager で決まります。</span>
           )}
         </footer>
 
@@ -226,60 +272,53 @@ function App() {
           </div>
         )}
 
-        {adminPrompt && (
-          <AdminPrompt
-            onDone={(ok) => {
-              adminPrompt.resolve(ok)
-              setAdminPrompt(null)
-              if (ok) {
-                setIsAdmin(true)
-                notify('管理者として認証しました')
-              }
-            }}
-          />
-        )}
       </div>
     </AppContext.Provider>
   )
 }
 
-function AdminPrompt({ onDone }) {
-  const [pass, setPass] = useState('')
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
-  const submit = async (e) => {
-    e?.preventDefault()
-    if (!pass) return
-    setBusy(true)
-    setError('')
-    try {
-      if (await api.verifyAdmin(pass)) onDone(true)
-      else setError('管理者パスワードが違います')
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setBusy(false)
-    }
-  }
+/** ログイン画面（Google でログイン。モックモードでは利用者・管理者を選ぶ） */
+function LoginScreen({ error, checking }) {
+  const buttonRef = useRef(null)
+  useEffect(() => {
+    if (buttonRef.current) auth.mountButton(buttonRef.current)
+  }, [checking, error])
   return (
-    <Modal
-      title="管理者パスワード"
-      onClose={() => onDone(false)}
-      footer={
-        <>
-          <Button variant="outline" onClick={() => onDone(false)}>キャンセル</Button>
-          <Button onClick={submit} disabled={!pass || busy}>{busy ? <Spinner /> : null}確認</Button>
-        </>
-      }
-    >
-      <form onSubmit={submit}>
-        <p class="mb-4 text-sm text-slate-500">既存データの編集・無効化、履歴の削除には管理者パスワードが必要です。一度入力すると、このタブを閉じるまで再入力は不要です。</p>
-        <Label label="パスワード">
-          <input type="password" value={pass} onInput={(e) => setPass(e.currentTarget.value)} class={inputCls} autocomplete="current-password" />
-        </Label>
-        {error && <p class="mt-2 text-sm text-red-600">{error}</p>}
-      </form>
-    </Modal>
+    <div class="flex min-h-screen items-center justify-center bg-[#f6f8fc] px-5 text-[#12233f]">
+      <div class="w-full max-w-sm rounded-2xl border border-[#dce5f2] bg-white p-7 shadow-sm">
+        <div class="flex items-center gap-3">
+          <span class="flex size-10 items-center justify-center rounded-xl bg-[#102c56] text-lg font-bold text-white">k</span>
+          <span>
+            <span class="block text-lg font-bold tracking-tight">kodama</span>
+            <span class="block text-xs text-slate-500">FSIF｜発信物ジェネレーター</span>
+          </span>
+        </div>
+        <p class="mt-6 text-sm leading-relaxed text-slate-600">FSIF Portal と同じ Google アカウントでログインしてください。使える人と管理者は FSIF の Access Manager で決まります。</p>
+        {error && (
+          <div class="mt-4">
+            <Alert tone="red">{error}</Alert>
+          </div>
+        )}
+        <div class="mt-6">
+          {checking ? (
+            <p class="flex items-center gap-2 text-sm text-slate-500">
+              <Spinner class="size-4 text-[#1261af]" />
+              確認しています…
+            </p>
+          ) : config.mock ? (
+            <div class="flex flex-col gap-2">
+              <p class="text-xs text-slate-500">モックモード：Google の代わりに、使う権限を選びます</p>
+              <Button onClick={() => auth.mockSignIn('user')}>利用者としてはじめる</Button>
+              <Button variant="outline" onClick={() => auth.mockSignIn('admin')}>
+                管理者としてはじめる
+              </Button>
+            </div>
+          ) : (
+            <div ref={buttonRef} class="flex min-h-11 justify-center" aria-label="Google でログイン" />
+          )}
+        </div>
+      </div>
+    </div>
   )
 }
 

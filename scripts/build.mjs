@@ -1,7 +1,8 @@
 // ビルド：CSS・JS・設定をすべて index.html 1枚にインライン化して dist/ に出力する。
-// StatiCrypt は HTML しか暗号化しないため、GAS の URL と利用者キーを含む JS を別ファイルに出さないこと。
+// 画面に埋め込むのは GAS の URL と Google ログインのクライアントID だけ（どちらも秘密ではない。
+// 使える人と管理者は、GAS が ID トークンを検証して FSIF の Access Manager に問い合わせて決める）。
 //
-//   npm run build          本番ビルド（GAS_URL / GAS_KEY 必須。ALLOW_MOCK=1 ならモックモードで出力）
+//   npm run build          本番ビルド（GAS_URL / GOOGLE_CLIENT_ID 必須。ALLOW_MOCK=1 ならモックモードで出力）
 //   npm run dev            開発サーバー（http://localhost:5173）。config.local.json が無ければモックモード
 import { build } from 'esbuild'
 import { execFileSync } from 'node:child_process'
@@ -17,14 +18,14 @@ const dev = process.argv.includes('--dev')
 
 function loadConfig() {
   let gasUrl = process.env.GAS_URL || ''
-  let key = process.env.GAS_KEY || ''
+  let googleClientId = (process.env.GOOGLE_CLIENT_ID || '').trim()
   const local = join(root, 'config.local.json')
-  if (!gasUrl && existsSync(local)) ({ gasUrl = '', key = '' } = JSON.parse(readFileSync(local, 'utf8')))
-  if (gasUrl && !key) throw new Error('GAS_URL を指定した場合は GAS_KEY（利用者キー）も必要です')
+  if (!gasUrl && existsSync(local)) ({ gasUrl = '', googleClientId = '' } = JSON.parse(readFileSync(local, 'utf8')))
+  if (gasUrl && !googleClientId) throw new Error('GAS_URL を指定した場合は GOOGLE_CLIENT_ID（Google ログインのクライアントID）も必要です')
   if (!gasUrl && !dev && process.env.ALLOW_MOCK !== '1') {
     throw new Error('GAS_URL が未設定です。モックモードで本番ビルドする場合は ALLOW_MOCK=1 を指定してください')
   }
-  return { gasUrl, key, mock: !gasUrl }
+  return { gasUrl, googleClientId, mock: !gasUrl }
 }
 
 async function bundleJs() {

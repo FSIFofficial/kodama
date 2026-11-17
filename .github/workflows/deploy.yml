@@ -61,41 +61,22 @@ jobs:
           cache: npm
       - run: npm ci
 
-      - name: Check secrets
+      # GAS の URL と Google ログインのクライアントID を index.html に埋め込む（どちらも秘密ではない。
+      # 使える人と管理者は、GAS が ID トークンを検証して FSIF の Access Manager に問い合わせて決める）
+      - name: Check settings
         env:
           GAS_URL: ${{ secrets.GAS_URL }}
-          GAS_KEY: ${{ secrets.GAS_KEY }}
-          SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
+          GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID || secrets.GOOGLE_CLIENT_ID }}
         run: |
-          for name in GAS_URL GAS_KEY SITE_PASSWORD; do
-            if [ -z "${!name}" ]; then echo "::error::Secrets に $name が設定されていません"; exit 1; fi
+          for name in GAS_URL GOOGLE_CLIENT_ID; do
+            if [ -z "${!name}" ]; then echo "::error::$name が設定されていません（GAS_URL は Secrets、GOOGLE_CLIENT_ID は Variables か Secrets）"; exit 1; fi
           done
 
-      # GAS の URL と利用者キーを index.html に埋め込む
       - name: Build
         env:
           GAS_URL: ${{ secrets.GAS_URL }}
-          GAS_KEY: ${{ secrets.GAS_KEY }}
+          GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID || secrets.GOOGLE_CLIENT_ID }}
         run: npm run build
-
-      # 出力フォルダ内の全 HTML を StatiCrypt で上書き暗号化する
-      - name: Encrypt with StatiCrypt
-        env:
-          STATICRYPT_PASSWORD: ${{ secrets.SITE_PASSWORD }}
-        run: npm run encrypt
-
-      # 暗号化に失敗して平文の URL・キーが公開されるのを防ぐ
-      - name: Verify no secrets in output
-        env:
-          GAS_URL: ${{ secrets.GAS_URL }}
-          GAS_KEY: ${{ secrets.GAS_KEY }}
-        run: |
-          if grep -rqF -- "$GAS_KEY" dist || grep -rqF -- "$GAS_URL" dist; then
-            echo "::error::暗号化されていない GAS の URL またはキーが出力に含まれています"; exit 1
-          fi
-          if find dist -name '*.js' | grep -q .; then
-            echo "::error::dist に JS ファイルがあります（StatiCrypt で暗号化されません）"; exit 1
-          fi
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

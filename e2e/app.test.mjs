@@ -20,13 +20,15 @@ after(async () => {
   await browser?.close()
 })
 
-// 新しいブラウザ（localStorage が空＝モックデータも初期状態）で開く
-async function open() {
+// 新しいブラウザ（localStorage が空＝モックデータも初期状態）で開き、ログインする。
+// モックモードのログインは Google の代わりに「利用者」「管理者」を選ぶ（本番は Access Manager の役割で決まる）
+async function open({ role = 'admin' } = {}) {
   const context = await browser.newContext({ viewport: { width: 1400, height: 900 }, acceptDownloads: true })
   const page = await context.newPage()
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
   await page.goto(pageUrl)
+  await page.getByRole('button', { name: role === 'admin' ? '管理者としてはじめる' : '利用者としてはじめる' }).click()
   await page.getByText('発信物を、ひとつの入力から。').waitFor()
   const nav = (name) => page.getByRole('button', { name, exact: true }).click()
   const toast = (text) => page.locator('.fixed.bottom-5', { hasText: text }).waitFor()
@@ -39,16 +41,10 @@ async function generate({ page, nav, toast }, orgName = 'サンプル団体') {
   await page.getByRole('button', { name: new RegExp(orgName) }).first().click()
   await page.getByRole('button', { name: '次へ' }).click()
   await page.getByRole('button', { name: '次へ' }).click()
-  await page.locator('main input').first().fill('テスト担当')
   for (const el of await page.locator('main input[type=date]').all()) await el.fill('2026-09-24')
   for (const el of await page.locator('main input[type=text], main textarea').all()) if (!(await el.inputValue())) await el.fill('テスト')
   await page.getByRole('button', { name: '文面を生成' }).click()
   await toast('履歴に保存しました')
-}
-
-async function adminLogin(page, pass = 'admin') {
-  await page.locator('input[type=password]').fill(pass)
-  await page.getByRole('button', { name: '確認' }).click()
 }
 
 test('資料作成：生成すると出力画面になり、履歴に残る。入力途中は続きから再開できる', async () => {
@@ -70,7 +66,7 @@ test('資料作成：生成すると出力画面になり、履歴に残る。�
   await page.getByText('公開前に団体名・日付・公開範囲を確認してください。').waitFor()
   assert.equal(await page.evaluate(() => localStorage.getItem('pg-draft')), null)
   await nav('履歴')
-  await page.getByText(/テスト担当 · H001/).waitFor()
+  await page.getByText(/モック 管理者 · H001/).waitFor()
   assert.deepEqual(app.errors, [])
   await app.close()
 })
@@ -80,11 +76,11 @@ test('履歴：作成者で絞り込み、CSV に書き出せる', async () => {
   const { page, nav } = app
   await generate(app)
   await nav('履歴')
-  await page.getByLabel('作成者').selectOption('テスト担当')
+  await page.getByLabel('作成者').selectOption('モック 管理者')
   const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', { name: /CSV（1件）/ }).click()])
   const csv = readFileSync(await download.path(), 'utf8')
   assert.ok(csv.startsWith('﻿履歴ID,作成日時,作成者,団体ID,団体名,セット,ランク,団体名'))
-  assert.match(csv.split('\r\n')[1], /^H001,.*,テスト担当,O001,サンプル団体,締結告知セット,ゴールド,サンプル団体/)
+  assert.match(csv.split('\r\n')[1], /^H001,.*,モック 管理者,O001,サンプル団体,締結告知セット,ゴールド,サンプル団体/)
   await page.getByLabel('期間（から）').fill('2000-01-01')
   await page.getByLabel('期間（まで）').fill('2000-01-02')
   await page.getByText('条件に合う履歴はありません。').waitFor()
@@ -96,8 +92,6 @@ test('管理：団体を一括登録すると一覧と操作ログに出る', as
   const app = await open()
   const { page, nav } = app
   await nav('管理')
-  await page.getByPlaceholder('名前を入力').fill('テスト太郎')
-  await page.getByPlaceholder('名前を入力').blur()
   await page.getByRole('button', { name: /^団体マスタ/ }).click()
   await page.getByRole('button', { name: '一括登録' }).click()
   await page.getByLabel('貼り付け欄').fill('団体名\t団体区分\n一括団体A\t大学\nサンプル団体\t\n一括団体B\t企業')
@@ -107,7 +101,7 @@ test('管理：団体を一括登録すると一覧と操作ログに出る', as
   await page.getByText('一括団体B').waitFor()
   await page.getByRole('button', { name: /^操作ログ/ }).click()
   await page.getByText('一括追加').first().waitFor()
-  assert.equal(await page.locator('table tbody tr', { hasText: 'テスト太郎' }).count(), 2)
+  assert.equal(await page.locator('table tbody tr', { hasText: 'モック 管理者（admin@example.com）' }).count(), 2)
   // 追加方法は一番右のタブ
   const tabs = await page.locator('main .flex-wrap.gap-1 > button').allInnerTexts()
   assert.equal(tabs.at(-1).trim(), '追加方法')
@@ -115,17 +109,23 @@ test('管理：団体を一括登録すると一覧と操作ログに出る', as
   await app.close()
 })
 
-test('管理者パス：5回続けて間違えると受け付けなくなる', async () => {
-  const app = await open()
-  const { page, nav } = app
+test('ログイン：利用者は編集できず、管理者は編集できる。ログアウトするとログイン画面に戻る', async () => {
+  const app = await open({ role: 'user' })
+  const { page, nav, toast } = app
+  await page.getByText('モック 利用者').waitFor()
   await nav('管理')
-  await page.getByRole('button', { name: '管理者パスワードを入力' }).click()
-  for (let i = 0; i < 5; i++) {
-    await adminLogin(page, `wrong${i}`)
-    await page.getByText('管理者パスワードが違います').waitFor()
-  }
-  await adminLogin(page, 'admin')
-  await page.getByText(/5回続けて間違えたため/).waitFor()
+  await page.getByText(/モック 利用者 として操作中（利用者）/).waitFor()
+  await page.getByRole('button', { name: '編集' }).first().click()
+  await toast('「管理者」の権限が必要です')
+  assert.equal(await page.getByRole('button', { name: '保存' }).count(), 0)
+  // ログアウト → 管理者でログインし直す
+  await page.getByRole('button', { name: 'ログアウト' }).click()
+  await page.getByRole('button', { name: '管理者としてはじめる' }).click()
+  await page.getByText('発信物を、ひとつの入力から。').waitFor()
+  await nav('管理')
+  await page.getByText(/モック 管理者 として操作中（管理者）/).waitFor()
+  await page.getByRole('button', { name: '編集' }).first().click()
+  await page.locator('label', { hasText: 'テンプレ名' }).locator('input').waitFor()
   assert.deepEqual(app.errors, [])
   await app.close()
 })
@@ -135,7 +135,6 @@ test('テンプレートの変更履歴：保存した版との差分を見て�
   const { page, nav, toast } = app
   await nav('管理')
   await page.getByRole('button', { name: '編集' }).first().click()
-  await adminLogin(page)
   const name = page.locator('label', { hasText: 'テンプレ名' }).locator('input')
   const original = await name.inputValue()
   await name.fill('変更後の名前')

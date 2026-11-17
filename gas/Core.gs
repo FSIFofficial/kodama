@@ -1,6 +1,10 @@
 /**
  * リクエスト処理の本体。GAS 固有の API には触らず、env 経由で DB・設定・ロックを受け取る。
- *   env = { db, docs, props: { userKey, adminPassword }, withLock(fn), now() }
+ *   env = { db, docs, props: { userKey, adminPassword }, auth, withLock(fn), now() }
+ *   auth は Google ログイン（FSIF の Access Manager で権限を決める）のアダプタ。無ければ Google ログインは使えない：
+ *     verifyIdToken(idToken) → { email, name }（検証できなければ例外）
+ *     checkAccess(email) → { allowed, roleKey, name, reason }（Access Manager の実効権限。役割キー admin が管理者）
+ *   props.userKey / adminPassword は以前の「利用者キー＋管理者パスワード」方式。USER_KEY を消すと使えなくなる
  *   docs は Google ドキュメントの雛形を扱うアダプタ：readText(fileId) / render({ fileId, replacements, format, fileName })
  *   slides は Google スライドの雛形を扱うアダプタ：readText(fileId) / render({ fileId, replacements, images, fileName })
  *   files はロゴなどの画像を保存・読み出すアダプタ：saveImage({ fileName, mimeType, base64 }) / readImage(fileId)
@@ -16,6 +20,7 @@ var ACTIONS = {
   create: { fn: actionCreate_, write: true },
   bulkCreate: { fn: actionBulkCreate_, write: true },
   verifyAdmin: { fn: actionVerifyAdmin_ },
+  whoami: { fn: actionWhoami_ },
   update: { fn: actionUpdate_, write: true, admin: true },
   deactivate: { fn: actionDeactivate_, write: true, admin: true },
   deleteHistory: { fn: actionDeleteHistory_, write: true, admin: true },
@@ -32,9 +37,14 @@ function handleRequest(req, env) {
     if (!req || typeof req !== 'object') return fail_('BAD_REQUEST');
     var def = ACTIONS[req.action];
     if (!def) return fail_('UNKNOWN_ACTION');
-    if (!env.props.userKey || !env.props.adminPassword) return fail_('SERVER_NOT_CONFIGURED');
-    if (!safeEqual_(req.key, env.props.userKey)) return fail_('UNAUTHORIZED');
-    if (def.admin && !checkAdminPass_(req, env)) return fail_('ADMIN_REQUIRED');
+    var user = authenticate_(req, env);
+    if (user.error) return fail_(user.error, user.message);
+    req.user = user;
+    if (def.admin && !isAdmin_(req, env)) {
+      return user.via === 'google'
+        ? fail_('ADMIN_REQUIRED', 'この操作には kodama の「管理者」の権限が必要です。FSIF の Access Manager で付けてもらってください')
+        : fail_('ADMIN_REQUIRED');
+    }
     var payload = req.payload && typeof req.payload === 'object' ? req.payload : {};
     var run = function () { return def.fn(payload, env, req); };
     return { ok: true, data: def.write ? env.withLock(run) : run() };
@@ -42,6 +52,36 @@ function handleRequest(req, env) {
     if (e && e.appCode) return fail_(e.appCode, e.message);
     return fail_('SERVER_ERROR', String((e && e.message) || e));
   }
+}
+
+/**
+ * だれからのリクエストかを確かめる。
+ * - Google ログイン（idToken）：ID トークンを検証し、Access Manager で kodama を使えるか・役割を確かめる
+ * - 以前の方式（key）：利用者キーと照合する（USER_KEY が設定されている間だけ）
+ * 返り値：{ via: 'google', email, name, role: 'admin' | 'user' } / { via: 'key' } / { error, message }
+ */
+function authenticate_(req, env) {
+  if (req.idToken) {
+    if (!env.auth) return { error: 'SERVER_NOT_CONFIGURED', message: 'Google ログインの設定（GOOGLE_CLIENT_ID・ACCESS_GAS_URL・ACCESS_TOOL_ID・ACCESS_TOOL_KEY）が GAS にありません' };
+    var who = env.auth.verifyIdToken(String(req.idToken));
+    var email = String(who.email || '').toLowerCase();
+    var access = env.auth.checkAccess(email);
+    if (!access.allowed) {
+      return { error: 'NOT_ALLOWED', message: email + ' では kodama を使えません（' + (access.reason || '付与なし') + '）。FSIF の Access Manager で利用を許可してもらってください' };
+    }
+    return { via: 'google', email: email, name: str_(access.name || who.name || email).slice(0, 50), role: access.roleKey === 'admin' ? 'admin' : 'user' };
+  }
+  if (!env.props.userKey || !env.props.adminPassword) {
+    return env.auth ? { error: 'UNAUTHORIZED', message: 'Google でログインしてください' } : { error: 'SERVER_NOT_CONFIGURED' };
+  }
+  if (!safeEqual_(req.key, env.props.userKey)) return { error: 'UNAUTHORIZED' };
+  return { via: 'key' };
+}
+
+// 管理者か。Google ログインなら Access Manager の役割、以前の方式なら管理者パスワードで決まる
+function isAdmin_(req, env) {
+  if (req.user && req.user.via === 'google') return req.user.role === 'admin';
+  return checkAdminPass_(req, env);
 }
 
 function appError_(code, message) {
@@ -351,7 +391,13 @@ function childRows_(entity, children) {
 // ---------- action ----------
 
 function actionVerifyAdmin_(payload, env, req) {
-  return { valid: checkAdminPass_(req, env) };
+  return { valid: isAdmin_(req, env) };
+}
+
+// ログインしている人（画面のヘッダーと、管理者かどうかの判定に使う）
+function actionWhoami_(payload, env, req) {
+  var u = req.user || {};
+  return u.via === 'google' ? { email: u.email, name: u.name, role: u.role } : { email: '', name: actorName_(req), role: '' };
 }
 
 function actionInit_(payload, env) {
@@ -478,15 +524,17 @@ function actionGetHistory_(payload, env) {
   return history;
 }
 
-function actionSaveHistory_(payload, env) {
+function actionSaveHistory_(payload, env, req) {
   var h = payload.history || {};
+  var google = req && req.user && req.user.via === 'google';
   var table = loadTable_(env, 'history');
   var rec = h.id ? findRecord_(table, h.id) : null;
   if (h.id && !rec) throw appError_('NOT_FOUND', '上書きする履歴が見つかりません');
   var obj = {
     id: rec ? rec.obj.id : nextId_('H', table.records),
     createdAt: rec ? rec.obj.createdAt : env.now(),
-    author: str_(h.author), orgId: str_(h.orgId), orgName: str_(h.orgName), setId: str_(h.setId), rank: str_(h.rank),
+    // Google ログインなら作成者はログインしている人（上書きでは最初に作った人のまま）
+    author: google ? (rec ? rec.obj.author : req.user.name) : str_(h.author), orgId: str_(h.orgId), orgName: str_(h.orgName), setId: str_(h.setId), rank: str_(h.rank),
     values: JSON.stringify(h.values || {}),
     status: rec ? rec.obj.status : '',
   };
@@ -605,8 +653,11 @@ function diffChildren_(env, childEntity, parentId, rows) {
   return sig(current) === sig(rows) ? [] : ['欄の構成を変更'];
 }
 
+// 操作ログ・テンプレート履歴に残す名前。Google ログインならアカウントの名前（メール）、以前の方式なら画面が送る作成者名
 function actorName_(req) {
-  return req ? str_(req.actor).slice(0, 50) || '（名前未入力）' : 'GASエディタ';
+  if (!req) return 'GASエディタ';
+  if (req.user && req.user.via === 'google') return (req.user.name + '（' + req.user.email + '）').slice(0, 100);
+  return str_(req.actor).slice(0, 50) || '（名前未入力）';
 }
 
 // あとから足したシート（操作ログ・テンプレート履歴）は、本番に無ければ作ってから読む
@@ -644,7 +695,7 @@ function writeLogs_(env, req, entries) {
     var s = SCHEMA.logs;
     var table = ensureTable_(env, 'logs');
     var actor = actorName_(req);
-    var role = !req ? '' : safeEqual_(req.adminPass, env.props.adminPassword) ? '管理者' : '利用者';
+    var role = !req ? '' : req.user && req.user.via === 'google' ? (req.user.role === 'admin' ? '管理者' : '利用者') : safeEqual_(req.adminPass, env.props.adminPassword) ? '管理者' : '利用者';
     var at = env.now();
     env.db.appendRows(s.sheet, entries.map(function (e) {
       return toRow_(table, { at: at, actor: actor, role: role, action: e.action, entity: ENTITY_LABELS[e.entity] || e.entity, key: String(e.key == null ? '' : e.key), detail: String(e.detail || '').slice(0, 2000) });
