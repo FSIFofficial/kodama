@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'preact/hooks'
-import { Ban, Copy, Lock, Pencil, Plus, RotateCcw, Search, Trash2, Upload } from 'lucide-preact'
+import { Ban, Copy, Pencil, Plus, RotateCcw, Search, Trash2, Upload } from 'lucide-preact'
 import { mapOrgColumns, orgRowsFromTable, parseDelimited } from '../lib/csv.js'
 import { COMMON_RANK, formatDate, isFileTemplate, isImageTemplate } from '../lib/engine.js'
-import { readAuthor, saveAuthor } from '../lib/storage.js'
 import { Alert, Badge, Button, DocLink, Empty, ImageUpload, Eyebrow, ItemInput, Label, Modal, Spinner, card, cx, formatDateTime, inputCls, textareaCls, useApp } from '../ui/ui.jsx'
 import { AddGuide } from './Guide.jsx'
 import { TemplateEditor } from './TemplateEditor.jsx'
@@ -89,7 +88,7 @@ const ENTITIES = [
 ]
 
 export function Admin() {
-  const { data, isAdmin, requireAdmin } = useApp()
+  const { data, isAdmin, me } = useApp()
   const [tab, setTab] = useState('templates')
   const [editor, setEditor] = useState(null)
 
@@ -109,13 +108,12 @@ export function Admin() {
         <div>
           <Eyebrow>SETTINGS / ADMIN</Eyebrow>
           <h1 class="mt-2 text-3xl font-bold">管理</h1>
-          <p class="mt-2 text-sm text-slate-500">一覧の閲覧と新規追加はどなたでもできます。既存データの編集・無効化には管理者パスワードが必要です。</p>
+          <p class="mt-2 text-sm text-slate-500">一覧の閲覧と新規追加はどなたでもできます。既存データの編集・無効化は管理者だけができます（管理者は FSIF の Access Manager で決まります）。</p>
         </div>
         <div class="flex flex-wrap items-end gap-3">
-          <ActorName />
-          {!isAdmin && (
-            <Button variant="outline" icon={Lock} onClick={requireAdmin}>管理者パスワードを入力</Button>
-          )}
+          <p class="text-xs text-slate-500">
+            {me?.name} として操作中（{isAdmin ? '管理者' : '利用者'}）。操作ログに記録されます。
+          </p>
         </div>
       </div>
       <div class="mt-6 flex flex-wrap gap-1 rounded-xl bg-[#eef2f8] p-1 text-sm font-medium">
@@ -128,23 +126,6 @@ export function Admin() {
       </div>
       <div class="mt-6">{content}</div>
     </section>
-  )
-}
-
-// 操作ログに残す名前（資料作成の「作成者名」と共通。本人確認ではなく記録用）
-function ActorName() {
-  const [name, setName] = useState(readAuthor())
-  return (
-    <label class="text-xs font-medium text-slate-500">
-      操作者名（操作ログに記録）
-      <input
-        value={name}
-        onInput={(e) => setName(e.currentTarget.value)}
-        onChange={(e) => saveAuthor(e.currentTarget.value.trim())}
-        placeholder="名前を入力"
-        class="mt-1 block h-10 w-44 rounded-lg border border-[#dce5f2] bg-white px-3 text-sm text-[#12233f]"
-      />
-    </label>
   )
 }
 

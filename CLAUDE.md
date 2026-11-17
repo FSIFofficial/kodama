@@ -11,14 +11,14 @@
 
 ## 0. 決定済み事項・現在の構成
 
-### セキュリティ方式：B（HTML+JS ＋ StatiCrypt）に決定済み
+### セキュリティ方式：B（HTML+JS）＋ Google ログイン（FSIF Access Manager で権限を決める）
 
 - v0 の出力は Next.js だったが、ユーザー判断で **方式B** を採用。Next.js は撤去済み
 - Preact（約10KB）＋ esbuild で JSX を1本の JS にバンドルし、**CSS・JS・設定をすべて `dist/index.html` 1枚にインライン化**する
-  - StatiCrypt は HTML しか暗号化しないため、**JS を別ファイルに出してはいけない**（デプロイ時に `dist/*.js` があれば失敗させている）
-- GAS の URL と利用者キーはビルド時に Secrets（`GAS_URL` / `GAS_KEY`）から `window.APP_CONFIG` として埋め込み、StatiCrypt（`SITE_PASSWORD`）で暗号化
-- 管理者パスワードはフロントに埋め込まない。画面で入力し sessionStorage に保持、GAS 側でも必ず照合
-- デプロイ後の出力に平文の URL・キーが含まれていないかをワークフローで検査している
+- ログインは FSIF Portal と同じ Google アカウント（Google Identity Services）。ID トークン（約1時間）はタブの sessionStorage にだけ置き、失効の少し前に自動で取り直す
+- GAS は毎回 ID トークンを検証し（tokeninfo。aud＝`GOOGLE_CLIENT_ID`）、**FSIF の Access Manager**（ポータルの `/access/`）に kodama を使えるか・役割を問い合わせる（`checkAccess`、5分キャッシュ）。役割キー `admin` が管理者、ほかの役割は利用者。問い合わせできなければ通さない
+- 画面に埋め込むのは GAS の URL と Google ログインのクライアントID だけ（どちらも秘密ではない）。ビルド時に `GAS_URL`（Secrets）・`GOOGLE_CLIENT_ID`（Variables か Secrets）から `window.APP_CONFIG` として埋め込む
+- 以前の StatiCrypt（共通パスワード）・利用者キー（`USER_KEY`）・管理者パスワードはやめた。GAS は移行期間のため、スクリプトプロパティ `USER_KEY` がある間だけ以前の方式も受け付ける（消すと Google ログインだけ）
 
 ### 実データの置き場所
 
@@ -30,14 +30,15 @@
 
 ```
 src/                フロント（Preact + Tailwind v4）
-  main.jsx          画面の外枠・ナビ・管理者パス入力・トースト
+  main.jsx          画面の外枠・ナビ・ログイン画面・トースト
   lib/engine.js     テンプレエンジン（差し込み・日付書式・ランク別選択・X分割・X文字数）
-  lib/api.js        GAS クライアント（text/plain POST、キー・管理者パス付与、エラー文言）
+  lib/api.js        GAS クライアント（text/plain POST、ID トークン付与、エラー文言）
+  lib/google-auth.js Google ログイン（ID トークンの保持・取り直し。モックモードは利用者／管理者を選ぶ）
   lib/mock-backend.js  モックモード（gas/Core.gs をブラウザ内で実行）
   lib/memory-db.js  SheetDb と同じ形のメモリDB（モックとテストで使用）
   lib/csv.js        CSV / TSV の読み込み（団体の一括登録）と書き出し（履歴）
   lib/diff.js       行単位の差分（テンプレートの変更履歴）
-  lib/storage.js    localStorage（作成者名・入力途中の下書き）
+  lib/storage.js    localStorage（入力途中の下書き）
   lib/similar.js    似た団体名の判定（二重登録の警告）
   lib/style-check.js 表記チェック（共通設定「表記ルール」）
   lib/links.js      メールソフト（mailto）・X の投稿画面を開くリンク
@@ -55,11 +56,10 @@ scripts/build.mjs   ビルド・開発サーバー
 
 ### コマンド
 
-- `npm run dev` … http://localhost:5173 。`config.local.json`（`{"gasUrl": "...", "key": "..."}`、git 管理外）が無ければモックモード（管理者パスは `admin`）
+- `npm run dev` … http://localhost:5173 。`config.local.json`（`{"gasUrl": "...", "googleClientId": "..."}`、git 管理外）が無ければモックモード（ログイン画面で「利用者」「管理者」を選ぶ）
 - `npm test` … テンプレエンジン・GAS Core・CSV・差分の単体テスト
 - `npm run e2e` … 画面の通しテスト（モックモードでビルドしてから Playwright で操作。初回は `npx playwright install chromium`）
-- `npm run build` … 本番ビルド（`GAS_URL` / `GAS_KEY` 必須。`ALLOW_MOCK=1` でモックモード）
-- `npm run encrypt` … `STATICRYPT_PASSWORD` で `dist/*.html` を暗号化
+- `npm run build` … 本番ビルド（`GAS_URL` / `GOOGLE_CLIENT_ID` 必須。`ALLOW_MOCK=1` でモックモード）
 
 ---
 
@@ -74,7 +74,8 @@ scripts/build.mjs   ビルド・開発サーバー
 ## 2. 構成
 
 ```
-GitHub Pages（StatiCrypt で暗号化した画面） ──キー付きリクエスト──> GAS Webアプリ ──> スプレッドシート（非公開）
+GitHub Pages（画面・Google でログイン） ──ID トークン付きリクエスト──> GAS Webアプリ ──> スプレッドシート（非公開）
+                                                                     ├──> FSIF Access Manager（使えるか・管理者か）
                                                                      └──> Googleドライブ（書類・告知画像の雛形、団体ロゴ）
 ```
 
@@ -89,7 +90,7 @@ GitHub Pages（StatiCrypt で暗号化した画面） ──キー付きリク�
 
 - GitHub Pages → GAS の POST は CORS のプリフライトを避けるため `Content-Type: text/plain` で JSON 文字列を送る
 - GAS は `doPost(e)` で `JSON.parse(e.postData.contents)` し、`ContentService.createTextOutput(JSON.stringify(res)).setMimeType(ContentService.MimeType.JSON)` で返す
-- リクエスト形式：`{ action: "init", key: "...", adminPass?: "...", actor?: "作成者名", payload: {...} }`（`actor` は操作ログに残す名前。本人確認ではなく記録用）
+- リクエスト形式：`{ action: "init", idToken: "...", payload: {...} }`。操作ログ・履歴の作成者は、GAS がログインしている人（Access Manager の名前とメール）で記録する（画面が送る名前は使わない）
 - レスポンス形式：`{ ok: true, data: {...} }` / `{ ok: false, error: "UNAUTHORIZED", message?: "..." }`
 
 ## 3. 権限
@@ -109,15 +110,15 @@ GitHub Pages（StatiCrypt で暗号化した画面） ──キー付きリク�
 | 履歴の削除 | × | ○ |
 
 - 利用者が追加したテンプレも、以後の修正は管理者のみ（例外なし・確定）
-- 管理者パスは、編集・無効化ボタン押下時に入力。画面が保持し該当リクエストに自動付与。**GAS 側でも必ず照合**（画面側だけの制御にしない）
-- 総当たり対策：管理者パスを5回続けて間違えると10分間 `ADMIN_LOCKED`（正しいパスも受け付けない）。回数は CacheService で全体に数える（GAS では接続元を区別できないため）。正しく入力すると0に戻る。空のパスは数えない
+- 利用者か管理者かは、Access Manager の kodama の役割で決まる（役割キー `admin`＝管理者。Access Manager では「利用者／管理者」のひな形で定義する）。**GAS 側で必ず判定**（画面側は表示を変えるだけ）。権限を変えてから反映まで最大5分
+- 使えない人（付与なし・退会・未登録）は `NOT_ALLOWED`、管理者でない人の管理者操作は `ADMIN_REQUIRED`、Access Manager に問い合わせできないときは `ACCESS_UNAVAILABLE`
 - 書き込み系は GAS で `LockService` による排他制御
-- スクリプトプロパティ：`USER_KEY`（利用者キー）、`ADMIN_PASSWORD`、`SPREADSHEET_ID`（スプレッドシートに紐づくスクリプトなら不要）、`OUTPUT_FOLDER_ID`（書類・告知画像の控えを残すフォルダ。省略時は控えを残さない）、`LOGO_FOLDER_ID`（団体ロゴなどの画像の保存先。一般公開しない）、`BACKUP_FOLDER_ID`（スプレッドシートの毎日のバックアップ先。省略時はバックアップしない）
+- スクリプトプロパティ：`GOOGLE_CLIENT_ID`（Google ログインのクライアントID。ポータルと共通）、`ACCESS_GAS_URL`（Access Manager の GAS の URL）、`ACCESS_TOOL_ID`（Access Manager での kodama のツールID）、`ACCESS_TOOL_KEY`（Access Manager の GAS の `issueToolKeys` で出たキー）、`SPREADSHEET_ID`（スプレッドシートに紐づくスクリプトなら不要）、`OUTPUT_FOLDER_ID`（書類・告知画像の控えを残すフォルダ。省略時は控えを残さない）、`LOGO_FOLDER_ID`（団体ロゴなどの画像の保存先。一般公開しない）、`BACKUP_FOLDER_ID`（スプレッドシートの毎日のバックアップ先。省略時はバックアップしない）
 
 ## 4. 画面
 
 ```
-ログイン（StatiCrypt） → ホーム ┬ 資料を作る：1 団体選択 → 2 セット・ランク選択 → 3 案件情報入力 → 4 出力
+ログイン（Google） → ホーム ┬ 資料を作る：1 団体選択 → 2 セット・ランク選択 → 3 案件情報入力 → 4 出力
                                ├ 履歴（→「これを元に作り直す」で 3 へ）
                                ├ 管理（テンプレート／セット／媒体／入力項目／ランク／日付書式／団体マスタ／共通設定／共通パーツ／利用状況／操作ログ／追加方法）
                                └ 使い方
@@ -130,7 +131,7 @@ GitHub Pages（StatiCrypt で暗号化した画面） ──キー付きリク�
    - 選んだテンプレで使われている項目だけをフォーム表示（テンプレ本文から `{{ }}` を抽出して生成）
    - 団体情報はマスタから自動入力。修正は今回の資料のみに反映（管理者はマスタ更新も選択可）
    - 右側にリアルタイムプレビュー
-   - 作成者名：初回のみ入力し localStorage に記憶（本人確認ではなく記録用）。操作ログの「操作者」にも使う
+   - 作成者：ログインしている人（入力欄は無い）。履歴と操作ログに残る
    - 入力途中の自動保存：STEP 1〜3 の入力（団体・セット・ランク・媒体・入力値・STEP）を localStorage `pg-draft` に保存。次に「新規作成」を開くと「続きから／破棄する」を出す。生成して履歴に保存したら消す（このブラウザだけ）
 4. **出力**
    - 媒体ごとのタブ、欄ごと（件名／本文／ハッシュタグ等）にコピーボタン
@@ -150,9 +151,9 @@ GitHub Pages（StatiCrypt で暗号化した画面） ──キー付きリク�
 
 ### 管理画面
 - 利用者でも入れて、一覧閲覧と新規追加が可能
-- 編集・無効化ボタン押下時に管理者パスを要求（入力後はそのタブを閉じるまで再入力なし）
+- 編集・無効化は管理者だけ（管理者でなければ押したときに知らせる）
 - 削除は「有効」列を FALSE にする無効化。過去の履歴は壊さない
-- 画面右上の「操作者名」は作成者名と共通（localStorage）。操作ログに残る
+- 操作ログには、ログインしている人の名前とメールアドレスが残る
 - 団体マスタの「一括登録」：スプレッドシートから見出し行ごと貼り付けるか CSV（UTF-8 / Shift_JIS）を選ぶ。見出しは項目キーか表示名で対応づけ、団体マスタに無い列は読まない。団体名が空・登録済み（無効含む）・一括内で重複の行は飛ばす。1回500件まで。ロゴは後から個別に
 - 「共通パーツ」タブ：署名ブロックなどよく使う文章を登録。テンプレートから `{{部品:パーツ名}}` で差し込む
 - 「利用状況」タブ：作成数（全期間・今月）、有効な団体数、作成者数、直近12か月の月別作成数、セット・ランク・作成者・団体ごとの件数。画面が持っている履歴一覧から集計（通信なし）
@@ -263,7 +264,8 @@ IDは GAS が自動採番（例 T001）。削除は「有効」列を FALSE。1�
 | bulkCreate | 団体の一括追加 `{ entity: 'orgs', rows: [{ values }] }` → `{ created, skipped, ignoredColumns }` | 利用者 |
 | listLogs | 操作ログ（新しい順、`limit` 既定300・最大2000） | 利用者 |
 | listTemplateRevisions | テンプレートの変更履歴 `{ templateId }` → `[{ at, actor, template }]`（新しい順・最大100） | 利用者 |
-| verifyAdmin | 管理者パス照合 | 利用者 |
+| whoami | ログインしている人（名前・メール・役割） | 利用者 |
+| verifyAdmin | 管理者か（Google ログインなら役割、以前の方式なら管理者パス） | 利用者 |
 | update | 既存行の更新（団体マスタ含む）。キー列は変更不可 | 管理者 |
 | deactivate | 有効を FALSE に（`active: true` で再有効化） | 管理者 |
 | deleteHistory | 履歴と履歴出力の行を削除 | 管理者 |
@@ -291,24 +293,32 @@ IDは GAS が自動採番（例 T001）。削除は「有効」列を FALSE。1�
 
 ## 10. デプロイ
 
-- `.github/workflows/deploy.yml`：PR と main で 単体テスト・画面の通しテスト（e2e）。main への push ではさらに ビルド（`GAS_URL` / `GAS_KEY` を埋め込み）→ StatiCrypt 暗号化（`SITE_PASSWORD`）→ 平文漏れ検査 → GitHub Pages
+- `.github/workflows/deploy.yml`：PR と main で 単体テスト・画面の通しテスト（e2e）。main への push ではさらに ビルド（`GAS_URL` / `GOOGLE_CLIENT_ID` を埋め込み）→ GitHub Pages
 - `.github/workflows/deploy-gas.yml`：`gas/` を変えて main に push すると テスト → `clasp push --force` → 既存のウェブアプリのデプロイを新しいバージョンに更新（URL は変わらない）。Actions タブから手動実行も可。Secrets が未設定なら何もしない（手作業のコピーのままでも動く）
 - PR ではシークレットを使わずモックモードのビルドとテストだけを行う
-- GAS の URL・キーはリポジトリに直書きしない
+- GAS の URL・Access Manager のキーはリポジトリに直書きしない
 
 ### セットアップ手順（作り直し・引き継ぎ時）
 
 **スプレッドシートと GAS**
 1. 管理メンバーだけで共有するスプレッドシートを作成し、「拡張機能 → Apps Script」を開く
 2. `gas/` の `.gs` ファイルをすべてコピーする（または clasp で `gas/` を push）。`appsscript.json` はプロジェクトの設定で「マニフェスト ファイルをエディタで表示する」をオンにすると編集できる（タイムゾーン Asia/Tokyo・V8 になっていればよい）
-3. プロジェクトの設定 → スクリプト プロパティに `USER_KEY`（推測されにくい長いランダム文字列）と `ADMIN_PASSWORD` を追加。必要に応じて `OUTPUT_FOLDER_ID`
+3. プロジェクトの設定 → スクリプト プロパティに `GOOGLE_CLIENT_ID`・`ACCESS_GAS_URL`・`ACCESS_TOOL_ID`・`ACCESS_TOOL_KEY` を追加（下の「Access Manager」）。必要に応じて `OUTPUT_FOLDER_ID`
 4. エディタで `setup` を実行 → 15シートとヘッダー、モックデータができる（既にデータがあるシートには触らない）。初回は権限の承認が出る
 5. デプロイ → 新しいデプロイ → ウェブアプリ、実行ユーザー「自分」、アクセス「全員」でデプロイし、URL（末尾 `/exec`）を控える
 
 **GitHub**
 1. Settings → Pages → Source を GitHub Actions にする
-2. Settings → Secrets and variables → Actions に `GAS_URL`（上の URL）、`GAS_KEY`（`USER_KEY` と同じ値）、`SITE_PASSWORD`（画面を開くときの利用者パスワード）を登録
-3. main に push するとデプロイされる
+2. Settings → Secrets and variables → Actions の Secrets に `GAS_URL`（上の URL）、Variables（または Secrets）に `GOOGLE_CLIENT_ID`（ポータルと同じクライアントID）を登録
+3. Google Cloud Console のポータルの OAuth クライアントの「承認済みの JavaScript 生成元」に `https://fsifofficial.github.io` を追加
+4. main に push するとデプロイされる
+
+**Access Manager（使える人と管理者）**
+1. ポータルの Access Manager（`/access/`）の「ツール・同期」で kodama を取り込み、「役割・連携を設定」でひな形「利用者／管理者」（役割キー `user` / `admin`）を選び、連携状態を「連携済み」にする
+2. 使う人に kodama の役割を付ける（部署のテンプレートでも、手動でもよい）
+3. Access Manager の GAS エディタで `issueToolKeys` を実行し、ログに出た kodama のツールIDとキーを、kodama の GAS の `ACCESS_TOOL_ID`・`ACCESS_TOOL_KEY` に設定する。`ACCESS_GAS_URL` は Access Manager の GAS の URL
+4. kodama の GAS エディタで `testAccessLink`（メールアドレスを書き換えて）を実行し、役割が返ることを確かめる
+- 以前の方式からの移行：上をそろえてから画面を公開し、全員が Google でログインできることを確かめたら、スクリプトプロパティの `USER_KEY`・`ADMIN_PASSWORD` を削除し、GitHub の Secrets の `GAS_KEY`・`SITE_PASSWORD` も削除する
 
 **書類テンプレート**
 1. 雛形にする Word ファイルをドライブにアップロードし、開いて「ファイル → Google ドキュメントとして保存」。差し込みたい箇所に `{{項目名}}` を書く
@@ -341,7 +351,7 @@ IDは GAS が自動採番（例 T001）。削除は「有効」列を FALSE。1�
 
 **実際の GAS につないでローカルで動かす**：リポジトリ直下に `config.local.json`（git 管理外）を置く
 ```json
-{ "gasUrl": "https://script.google.com/macros/s/xxxx/exec", "key": "利用者キー" }
+{ "gasUrl": "https://script.google.com/macros/s/xxxx/exec", "googleClientId": "xxxx.apps.googleusercontent.com" }
 ```
 
 ## 11. 後回しの機能（データ構造だけ先に用意）
@@ -370,5 +380,6 @@ IDは GAS が自動採番（例 T001）。削除は「有効」列を FALSE。1�
 15. ✅ メールソフト・X で開く、似た団体名の警告、表記チェック、共通パーツ、利用状況
 16. ✅ 名称を kodama に（リポジトリ名も FSIFofficial/kodama、サイトは https://fsifofficial.github.io/kodama/ ）、媒体のコピー形式「CSV行」
 17. ✅ 自由記述 `{{自由:見出し}}`、テンプレート編集から共通パーツを作成
+18. ✅ ログインを Google に（StatiCrypt・利用者キー・管理者パスワードをやめ、使える人と管理者は FSIF の Access Manager で決める）
 
 未決：画面の見た目の最終調整、本番（実際の Google ドキュメント／スライド）での書類・告知画像の出力確認

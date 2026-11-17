@@ -2,8 +2,12 @@
  * Webアプリの入口。「自分として実行」「全員（匿名ユーザーを含む）」でデプロイする。
  *
  * スクリプトプロパティ（プロジェクトの設定 → スクリプト プロパティ）:
- *   USER_KEY        利用者キー（フロントのビルド時に GAS_KEY として埋め込み、StatiCrypt で暗号化される）
- *   ADMIN_PASSWORD  管理者パスワード（画面で入力。フロントには埋め込まない）
+ *   GOOGLE_CLIENT_ID Google ログインのクライアントID（FSIF Portal と共通。ID トークンの aud と照合する）
+ *   ACCESS_GAS_URL   FSIF Access Manager の GAS の URL（…/exec）。使える人と役割（admin＝管理者）をここに問い合わせる
+ *   ACCESS_TOOL_ID   Access Manager での kodama のツールID
+ *   ACCESS_TOOL_KEY  Access Manager の GAS で issueToolKeys を実行して出た、kodama のキー
+ *   USER_KEY         （以前の方式・移行期間だけ）利用者キー。消すと Google ログインだけになる
+ *   ADMIN_PASSWORD   （以前の方式・移行期間だけ）管理者パスワード
  *   SPREADSHEET_ID  データのスプレッドシートID（スプレッドシートに紐づいたスクリプトなら省略可）
  *   LOGO_FOLDER_ID  団体ロゴなどの画像を保存するフォルダID（一般公開しない。告知画像の {{ロゴ}} はここの画像だけを使う）
  *   OUTPUT_FOLDER_ID 書類・告知画像を出力したときの控えを残すフォルダID（省略時は控えを残さない）
@@ -45,6 +49,7 @@ function createEnv_() {
     slides: new SlidesAdapter(props.getProperty('OUTPUT_FOLDER_ID'), new FilesAdapter(props.getProperty('LOGO_FOLDER_ID'))),
     files: new FilesAdapter(props.getProperty('LOGO_FOLDER_ID')),
     cache: CacheService.getScriptCache(),
+    auth: createAuth_(props),
     props: {
       userKey: props.getProperty('USER_KEY'),
       adminPassword: props.getProperty('ADMIN_PASSWORD'),
@@ -264,12 +269,79 @@ SlidesAdapter.prototype.render = function (opts) {
   }
 };
 
+// ---------- Google ログイン（FSIF Access Manager で権限を決める） ----------
+
+var ID_TOKEN_ISSUERS = ['accounts.google.com', 'https://accounts.google.com'];
+var AUTH_CACHE_SECONDS = 300; // ID トークンの検証結果・Access Manager の権限を覚えておく秒数
+
+/** 4つのスクリプトプロパティがそろっていれば Google ログインのアダプタを返す（無ければ null） */
+function createAuth_(props) {
+  var clientId = props.getProperty('GOOGLE_CLIENT_ID');
+  var accessUrl = props.getProperty('ACCESS_GAS_URL');
+  var toolId = props.getProperty('ACCESS_TOOL_ID');
+  var toolKey = props.getProperty('ACCESS_TOOL_KEY');
+  if (!clientId || !accessUrl || !toolId || !toolKey) return null;
+  var cache = CacheService.getScriptCache();
+  var digest = function (text) {
+    return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8));
+  };
+  return {
+    // tokeninfo で署名・期限を確かめ、aud（クライアントID）・iss・メールの確認済みを照合する
+    verifyIdToken: function (idToken) {
+      var key = 'idt:' + digest(idToken);
+      var hit = cache.get(key);
+      if (hit) return JSON.parse(hit);
+      var fail = function () { return appError_('UNAUTHORIZED', 'Google のログインが切れています。ログインし直してください'); };
+      var res = UrlFetchApp.fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken), { muteHttpExceptions: true });
+      if (res.getResponseCode() !== 200) throw fail();
+      var info = JSON.parse(res.getContentText());
+      var exp = Number(info.exp);
+      if (info.aud !== clientId || ID_TOKEN_ISSUERS.indexOf(info.iss) < 0 || !(exp * 1000 > Date.now()) || String(info.email_verified) !== 'true') throw fail();
+      var who = { email: String(info.email || '').toLowerCase(), name: String(info.name || '').slice(0, 100) };
+      var ttl = Math.min(AUTH_CACHE_SECONDS, Math.floor(exp - Date.now() / 1000));
+      if (ttl > 0) cache.put(key, JSON.stringify(who), ttl);
+      return who;
+    },
+    // Access Manager の実効権限を問い合わせる。問い合わせできなければ通さない
+    checkAccess: function (email) {
+      var key = 'acc:' + email;
+      var hit = cache.get(key);
+      if (hit) return JSON.parse(hit);
+      var body;
+      try {
+        var res = UrlFetchApp.fetch(accessUrl, {
+          method: 'post',
+          contentType: 'text/plain;charset=utf-8',
+          payload: JSON.stringify({ action: 'checkAccess', payload: { toolId: toolId, key: toolKey, email: email } }),
+          followRedirects: true,
+          muteHttpExceptions: true,
+        });
+        body = JSON.parse(res.getContentText());
+      } catch (e) {
+        throw appError_('ACCESS_UNAVAILABLE', 'Access Manager に問い合わせできませんでした。少し待ってからもう一度お試しください');
+      }
+      if (!body.ok) throw appError_('ACCESS_UNAVAILABLE', 'Access Manager に問い合わせできませんでした：' + ((body.error && body.error.message) || '不明なエラー'));
+      var d = body.data;
+      var access = { allowed: !!d.allowed, roleKey: String(d.roleKey || ''), name: String(d.name || ''), reason: String(d.reason || '') };
+      cache.put(key, JSON.stringify(access), AUTH_CACHE_SECONDS);
+      return access;
+    },
+  };
+}
+
+/** GASエディタから手動実行：Access Manager につながるか確かめる（メールアドレスを書き換えて実行） */
+function testAccessLink() {
+  var auth = createAuth_(PropertiesService.getScriptProperties());
+  if (!auth) return Logger.log('Google ログインの設定がそろっていません：GOOGLE_CLIENT_ID・ACCESS_GAS_URL・ACCESS_TOOL_ID・ACCESS_TOOL_KEY');
+  Logger.log(JSON.stringify(auth.checkAccess('ここにメールアドレス')));
+}
+
 /** GASエディタから手動実行：全シートとヘッダーを作成し、空のシートにモックデータを投入する */
 function setup() {
   var seeded = seedTables(new SheetDb(getSpreadsheet_()), new Date());
   var props = PropertiesService.getScriptProperties();
-  ['USER_KEY', 'ADMIN_PASSWORD'].forEach(function (k) {
-    if (!props.getProperty(k)) Logger.log('スクリプトプロパティ ' + k + ' が未設定です');
+  ['GOOGLE_CLIENT_ID', 'ACCESS_GAS_URL', 'ACCESS_TOOL_ID', 'ACCESS_TOOL_KEY'].forEach(function (k) {
+    if (!props.getProperty(k)) Logger.log('スクリプトプロパティ ' + k + ' が未設定です（Google ログインに必要）');
   });
   Logger.log('モックデータを投入したシート: ' + (seeded.length ? seeded.join(', ') : 'なし（既存データを保持）'));
 }

@@ -1,14 +1,13 @@
-// GAS クライアント。利用者キーを全リクエストに、管理者パスは管理者操作に付与する。
-import { createMockBackend, MOCK_ADMIN_PASSWORD } from './mock-backend.js'
-import { readAuthor } from './storage.js'
-
-const ADMIN_PASS_KEY = 'pg-admin-pass'
+// GAS クライアント。Google ログインの ID トークンを全リクエストに付ける。
+// 使えるか・管理者かは GAS が FSIF の Access Manager に問い合わせて決める（画面側では判断しない）。
+import { createMockBackend } from './mock-backend.js'
 
 const MESSAGES = {
-  UNAUTHORIZED: '利用者キーが正しくありません。管理者に連絡してください。',
-  ADMIN_REQUIRED: '管理者パスワードが正しくないか、入力されていません。',
-  ADMIN_LOCKED: '管理者パスワードを続けて間違えたため、しばらく受け付けません。時間をおいてから入力してください。',
-  SERVER_NOT_CONFIGURED: 'GAS のスクリプトプロパティ（USER_KEY / ADMIN_PASSWORD）が未設定です。',
+  UNAUTHORIZED: 'Google のログインが切れています。ログインし直してください。',
+  NOT_ALLOWED: 'このアカウントでは kodama を使えません。FSIF の Access Manager で利用を許可してもらってください。',
+  ACCESS_UNAVAILABLE: '権限を確認できませんでした（Access Manager に問い合わせできませんでした）。少し待ってからもう一度お試しください。',
+  ADMIN_REQUIRED: 'この操作には kodama の「管理者」の権限が必要です。FSIF の Access Manager で付けてもらってください。',
+  SERVER_NOT_CONFIGURED: 'GAS のスクリプトプロパティ（GOOGLE_CLIENT_ID・ACCESS_GAS_URL・ACCESS_TOOL_ID・ACCESS_TOOL_KEY）が未設定です。',
   SHEET_MISSING: 'スプレッドシートにシートがありません。GAS エディタで setup() を実行してください。',
   BUSY: 'ほかの保存処理が混み合っています。少し待ってから再度お試しください。',
   NOT_FOUND: '対象のデータが見つかりません。',
@@ -36,27 +35,12 @@ export class ApiError extends Error {
   }
 }
 
-function readSession(key) {
-  try {
-    return sessionStorage.getItem(key) || ''
-  } catch {
-    return ''
-  }
-}
-
-function writeSession(key, value) {
-  try {
-    if (value) sessionStorage.setItem(key, value)
-    else sessionStorage.removeItem(key)
-  } catch {
-    // 保存できなくても画面のメモリには保持している
-  }
-}
-
-export function createApi(config) {
+/**
+ * getIdToken：いまの ID トークン（無ければ空）
+ * onAuthError：GAS がトークンを受け付けなかったとき（期限切れ）。ログイン画面に戻す
+ */
+export function createApi(config, { getIdToken, onAuthError } = {}) {
   const mock = config.mock ? createMockBackend() : null
-  const key = config.mock ? 'mock' : config.key
-  let adminPass = readSession(ADMIN_PASS_KEY)
 
   async function send(body) {
     if (mock) return mock(body)
@@ -79,37 +63,21 @@ export function createApi(config) {
     }
   }
 
-  async function call(action, payload = {}, { admin = false, adminPassOverride } = {}) {
-    // actor は操作ログに残す名前（作成者名。本人確認ではなく記録用）
-    const body = { action, key, payload, actor: readAuthor() }
-    const pass = adminPassOverride ?? (admin ? adminPass : '')
-    if (pass) body.adminPass = pass
-    const res = await send(body)
+  async function call(action, payload = {}) {
+    const res = await send({ action, idToken: getIdToken?.() || '', payload })
     if (!res || typeof res !== 'object') throw new ApiError('BAD_RESPONSE')
     if (!res.ok) {
-      if (res.error === 'ADMIN_REQUIRED') setAdminPass('')
+      if (res.error === 'UNAUTHORIZED') onAuthError?.()
       // USE_POST は画面側の説明（対処法つき）を出す
       throw new ApiError(res.error, res.error === 'USE_POST' ? '' : res.message)
     }
     return res.data
   }
 
-  function setAdminPass(pass) {
-    adminPass = pass
-    writeSession(ADMIN_PASS_KEY, pass)
-  }
-
   return {
     mock: Boolean(mock),
-    mockAdminPassword: mock ? MOCK_ADMIN_PASSWORD : '',
     call,
-    hasAdmin: () => Boolean(adminPass),
-    setAdminPass,
-    // 管理者パスを照合し、合っていれば保持する
-    async verifyAdmin(pass) {
-      const { valid } = await call('verifyAdmin', {}, { adminPassOverride: pass })
-      if (valid) setAdminPass(pass)
-      return valid
-    },
+    /** ログインしている人 { email, name, role: 'admin' | 'user' } */
+    whoami: () => call('whoami'),
   }
 }

@@ -3,7 +3,7 @@ import { ArrowLeft, ArrowRight, Check, FileText, History as HistoryIcon, Plus, S
 import { COMMON_RANK, LOGO_KEY, buildContext, fileReplacements, formItemsFor, generateOutputs, isFileTemplate, isImageTemplate, pickTemplates, renderSegments, splitXThread } from '../lib/engine.js'
 import { Alert, Badge, Button, Eyebrow, ImageUpload, ItemInput, Label, Spinner, StoredImage, activeOnly, card, cx, downloadBase64, formatDateTime, inputCls, useApp } from '../ui/ui.jsx'
 import { findSimilarOrgs } from '../lib/similar.js'
-import { clearDraft, readAuthor, readDraft, saveAuthor, saveDraft } from '../lib/storage.js'
+import { clearDraft, readDraft, saveDraft } from '../lib/storage.js'
 import { Output } from './Output.jsx'
 
 const STEPS = ['団体', 'セット・ランク', '案件情報', '出力']
@@ -44,7 +44,7 @@ function outputsFromRows(rows) {
 }
 
 export function Create({ seed }) {
-  const { api, data, reload, notify, adminCall, loadHistory } = useApp()
+  const { api, me, data, reload, notify, adminCall, loadHistory } = useApp()
   const firstSet = activeOnly(data.sets)[0]
   const firstRank = activeOnly(data.ranks)[0]
   const [step, setStep] = useState(1)
@@ -54,7 +54,8 @@ export function Create({ seed }) {
   const [setId, setSetId] = useState(seed.setId || firstSet?.id || '')
   const [rank, setRank] = useState(firstRank?.name || '')
   const [mediaIds, setMediaIds] = useState(null)
-  const [author, setAuthor] = useState(readAuthor())
+  // 作成者はログインしている人（GAS もログインしている人で記録する）
+  const author = me?.name || ''
   const [updateMaster, setUpdateMaster] = useState(false)
   const [outputs, setOutputs] = useState(null)
   const [original, setOriginal] = useState(null)
@@ -152,7 +153,7 @@ export function Create({ seed }) {
     })
   }
 
-  const canNext = step === 1 ? Boolean(org) : step === 2 ? Boolean(setId && rank && selectedMedia.length) : !missingRequired.length && author.trim()
+  const canNext = step === 1 ? Boolean(org) : step === 2 ? Boolean(setId && rank && selectedMedia.length) : !missingRequired.length
 
   const next = () => {
     if (step === 2) fillDefaults()
@@ -161,7 +162,7 @@ export function Create({ seed }) {
   }
 
   const historyPayload = (outs, base, editedFlags) => ({
-    history: { author: author.trim(), orgId, orgName: values['団体名'] || org?.values['団体名'] || '', setId, rank, values },
+    history: { author, orgId, orgName: values['団体名'] || org?.values['団体名'] || '', setId, rank, values },
     outputs: Object.entries(outs).flatMap(([mediaId, o]) =>
       Object.entries(o.fields).map(([fieldKey, text]) => ({
         mediaId, templateId: o.templateId, fieldKey, text,
@@ -171,7 +172,6 @@ export function Create({ seed }) {
   })
 
   const generate = async () => {
-    saveAuthor(author.trim())
     setBusy('generate')
     try {
       if (updateMaster && orgChanged) {
@@ -298,8 +298,6 @@ export function Create({ seed }) {
           orgChanged={orgChanged}
           updateMaster={updateMaster}
           setUpdateMaster={setUpdateMaster}
-          author={author}
-          setAuthor={setAuthor}
           missingRequired={missingRequired}
           picked={picked}
           mediaIds={selectedMedia}
@@ -519,17 +517,11 @@ function StepSet({ setId, rank, picked, availableMedia, selected, onSet, onRank,
 
 // ---------- STEP 3 案件情報 ----------
 
-function StepDetails({ form, values, org, orgValues, setOrgValues, caseValues, setCaseValues, orgChanged, updateMaster, setUpdateMaster, author, setAuthor, missingRequired, picked, mediaIds, ctx }) {
+function StepDetails({ form, values, org, orgValues, setOrgValues, caseValues, setCaseValues, orgChanged, updateMaster, setUpdateMaster, missingRequired, picked, mediaIds, ctx }) {
   const { isAdmin } = useApp()
   return (
     <div class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(380px,0.95fr)]">
       <div class="space-y-6">
-        <div class={`${card} p-6`}>
-          <Label label="作成者名" required hint="記録用です。このブラウザに記憶され、次回から自動で入ります。">
-            <input value={author} onInput={(e) => setAuthor(e.currentTarget.value)} class={cx(inputCls, 'max-w-xs')} />
-          </Label>
-        </div>
-
         {form.orgItems.length > 0 && (
           <div class={`${card} p-6`}>
             <div class="flex items-start justify-between gap-3">
@@ -563,7 +555,7 @@ function StepDetails({ form, values, org, orgValues, setOrgValues, caseValues, s
                 <input type="checkbox" class="size-4 accent-[#1261af]" checked={updateMaster} onChange={(e) => setUpdateMaster(e.currentTarget.checked)} />
                 <span>
                   修正内容を団体マスタにも反映する
-                  <span class="ml-1 text-xs text-slate-500">（管理者のみ。{isAdmin ? '管理者として認証済み' : '生成時にパスワードを確認します'}）</span>
+                  <span class="ml-1 text-xs text-slate-500">（管理者のみ。{isAdmin ? 'あなたは管理者です' : '管理者の権限が無いので反映されません'}）</span>
                 </span>
               </label>
             )}

@@ -401,3 +401,77 @@ test('媒体のコピー形式：既定は通常、CSV行を選べる。列が�
   assert.equal(media.find((m) => m.id === 'M005').copyFormat, 'CSV行')
   assert.equal(media.find((m) => m.id === 'M005').name, 'HPニュース')
 })
+
+// Google ログイン（Access Manager で権限を決める）
+function setupGoogle({ legacy = false } = {}) {
+  const base = setup()
+  const access = {
+    'admin@example.com': { allowed: true, roleKey: 'admin', name: '管理 花子', reason: '' },
+    'user@example.com': { allowed: true, roleKey: 'user', name: '利用 太郎', reason: '' },
+    'gone@example.com': { allowed: false, roleKey: '', name: '退会 次郎', reason: '退会済み' },
+  }
+  base.env.auth = {
+    verifyIdToken: (t) => {
+      if (!t.startsWith('tok:')) {
+        const e = new Error('Google のログインが切れています')
+        e.appCode = 'UNAUTHORIZED'
+        throw e
+      }
+      return { email: t.slice(4).toUpperCase(), name: 'Googleの名前' }
+    },
+    checkAccess: (email) => access[email] ?? { allowed: false, roleKey: '', name: '', reason: 'メンバー未登録' },
+  }
+  if (!legacy) base.env.props = { logoFolderId: '' }
+  const as = (email) => (action, payload = {}) => gas.handleRequest({ action, idToken: `tok:${email}`, payload }, base.env)
+  return { ...base, as }
+}
+
+test('Google ログイン：Access Manager の役割で、利用者と管理者が決まる', () => {
+  const { as, env } = setupGoogle()
+  const admin = as('admin@example.com')
+  const user = as('user@example.com')
+  assert.deepEqual(user('whoami').data, { email: 'user@example.com', name: '利用 太郎', role: 'user' })
+  assert.deepEqual(admin('whoami').data, { email: 'admin@example.com', name: '管理 花子', role: 'admin' })
+  assert.equal(user('init').ok, true)
+  // 利用者は追加できるが、編集・無効化・履歴の削除はできない
+  assert.equal(user('create', { entity: 'ranks', data: { name: 'ブロンズ' } }).ok, true)
+  const denied = user('update', { entity: 'sets', key: 'S001', data: { name: 'x' } })
+  assert.equal(denied.error, 'ADMIN_REQUIRED')
+  assert.match(denied.message, /Access Manager/)
+  assert.deepEqual(user('verifyAdmin').data, { valid: false })
+  // 管理者は管理者パスワードなしで編集できる
+  assert.equal(admin('update', { entity: 'sets', key: 'S001', data: { name: '締結告知セット（改）' } }).ok, true)
+  assert.deepEqual(admin('verifyAdmin').data, { valid: true })
+  // 使えない人・未登録・トークンが不正
+  const gone = as('gone@example.com')('init')
+  assert.equal(gone.error, 'NOT_ALLOWED')
+  assert.match(gone.message, /退会済み/)
+  assert.equal(as('nobody@example.com')('init').error, 'NOT_ALLOWED')
+  assert.equal(gas.handleRequest({ action: 'init', idToken: 'broken' }, env).error, 'UNAUTHORIZED')
+  // USER_KEY が無ければ、以前の方式（キー）は使えない
+  assert.equal(gas.handleRequest({ action: 'init', key: 'user-key' }, env).error, 'UNAUTHORIZED')
+})
+
+test('Google ログイン：操作ログと履歴の作成者はログインしている人になる', () => {
+  const { as } = setupGoogle()
+  const user = as('user@example.com')
+  user('create', { entity: 'ranks', data: { name: 'ブロンズ' } })
+  as('admin@example.com')('deactivate', { entity: 'ranks', key: 'ブロンズ' })
+  const logs = user('listLogs').data
+  assert.equal(logs[0].actor, '管理 花子（admin@example.com）')
+  assert.equal(logs[0].role, '管理者')
+  assert.equal(logs[1].actor, '利用 太郎（user@example.com）')
+  assert.equal(logs[1].role, '利用者')
+  // 画面が別の作成者名を送っても、記録されるのはログインしている人
+  const saved = user('saveHistory', { history: { author: 'なりすまし', orgId: 'O001', orgName: 'サンプル団体', setId: 'S001', rank: 'ゴールド', values: {} }, outputs: [] })
+  assert.equal(saved.ok, true)
+  const h = user('getHistory', { id: saved.data.id }).data
+  assert.equal(h.author, '利用 太郎')
+})
+
+test('移行期間：USER_KEY があれば、以前の方式（キー＋管理者パスワード）も使える', () => {
+  const { as, env } = setupGoogle({ legacy: true })
+  assert.equal(gas.handleRequest({ action: 'init', key: 'user-key' }, env).ok, true)
+  assert.equal(gas.handleRequest({ action: 'update', key: 'user-key', adminPass: 'admin-pass', payload: { entity: 'sets', key: 'S001', data: { name: 'y' } } }, env).ok, true)
+  assert.equal(as('user@example.com')('whoami').data.role, 'user')
+})
