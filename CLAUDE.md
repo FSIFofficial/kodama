@@ -15,8 +15,9 @@
 
 - v0 の出力は Next.js だったが、ユーザー判断で **方式B** を採用。Next.js は撤去済み
 - Preact（約10KB）＋ esbuild で JSX を1本の JS にバンドルし、**CSS・JS・設定をすべて `dist/index.html` 1枚にインライン化**する
-- ログインは FSIF Portal と同じ Google アカウント（Google Identity Services）。ID トークン（約1時間）はタブの sessionStorage にだけ置き、失効の少し前に自動で取り直す
-- GAS は毎回 ID トークンを検証し（tokeninfo。aud＝`GOOGLE_CLIENT_ID`）、**FSIF の Access Manager**（ポータルの `/access/`）に kodama を使えるか・役割を問い合わせる（`checkAccess`、5分キャッシュ）。役割キー `admin` が管理者、ほかの役割は利用者。問い合わせできなければ通さない
+- ログインは FSIF Portal と同じ Google アカウント（Google Identity Services）。ログインすると GAS（`startSession`）が ID トークンを検証し（tokeninfo。aud＝`GOOGLE_CLIENT_ID`）、**7日もつセッション**（`gas/FsifSession.gs` の署名付き文字列。秘密はスクリプトプロパティ `SESSION_SECRET`、無ければ自動で作る）を返す。画面は localStorage `kodama-session` に置く（再読み込み・別タブでもログインしたまま。ログアウトはポータルとは別）
+- ポータルの「開く」から来たときは、URL の `#fsif_ticket=…`（Access Manager が出す60秒・一度だけの引換券。`ACCESS_TOOL_KEY` で署名）で `startSession` し、Google の画面を出さずに入る
+- GAS は毎回セッションの署名と期限を確かめ、**FSIF の Access Manager**（ポータルの `/access/`）に kodama を使えるか・役割を問い合わせる（`checkAccess`、5分キャッシュ）。役割キー `admin` が管理者、ほかの役割は利用者。問い合わせできなければ通さない
 - 画面に埋め込むのは GAS の URL と Google ログインのクライアントID だけ（どちらも秘密ではない）。ビルド時に `GAS_URL`（Secrets）・`GOOGLE_CLIENT_ID`（Variables か Secrets）から `window.APP_CONFIG` として埋め込む
 - 以前の StatiCrypt（共通パスワード）・利用者キー（`USER_KEY`）・管理者パスワードはやめた。GAS は移行期間のため、スクリプトプロパティ `USER_KEY` がある間だけ以前の方式も受け付ける（消すと Google ログインだけ）
 
@@ -32,8 +33,8 @@
 src/                フロント（Preact + Tailwind v4）
   main.jsx          画面の外枠・ナビ・ログイン画面・トースト
   lib/engine.js     テンプレエンジン（差し込み・日付書式・ランク別選択・X分割・X文字数）
-  lib/api.js        GAS クライアント（text/plain POST、ID トークン付与、エラー文言）
-  lib/google-auth.js Google ログイン（ID トークンの保持・取り直し。モックモードは利用者／管理者を選ぶ）
+  lib/api.js        GAS クライアント（text/plain POST、セッション付与、エラー文言）
+  lib/google-auth.js ログイン（Google・ポータルの引換券 → セッション。モックモードは利用者／管理者を選ぶ）
   lib/mock-backend.js  モックモード（gas/Core.gs をブラウザ内で実行）
   lib/memory-db.js  SheetDb と同じ形のメモリDB（モックとテストで使用）
   lib/csv.js        CSV / TSV の読み込み（団体の一括登録）と書き出し（履歴）
@@ -74,7 +75,7 @@ scripts/build.mjs   ビルド・開発サーバー
 ## 2. 構成
 
 ```
-GitHub Pages（画面・Google でログイン） ──ID トークン付きリクエスト──> GAS Webアプリ ──> スプレッドシート（非公開）
+GitHub Pages（画面・Google でログイン） ──セッション付きリクエスト──> GAS Webアプリ ──> スプレッドシート（非公開）
                                                                      ├──> FSIF Access Manager（使えるか・管理者か）
                                                                      └──> Googleドライブ（書類・告知画像の雛形、団体ロゴ）
 ```
@@ -90,7 +91,7 @@ GitHub Pages（画面・Google でログイン） ──ID トークン付きリ
 
 - GitHub Pages → GAS の POST は CORS のプリフライトを避けるため `Content-Type: text/plain` で JSON 文字列を送る
 - GAS は `doPost(e)` で `JSON.parse(e.postData.contents)` し、`ContentService.createTextOutput(JSON.stringify(res)).setMimeType(ContentService.MimeType.JSON)` で返す
-- リクエスト形式：`{ action: "init", idToken: "...", payload: {...} }`。操作ログ・履歴の作成者は、GAS がログインしている人（Access Manager の名前とメール）で記録する（画面が送る名前は使わない）
+- リクエスト形式：`{ action: "init", session: "...", payload: {...} }`（`startSession` は `idToken` か `ticket`。古い画面は毎回 `idToken`）。操作ログ・履歴の作成者は、GAS がログインしている人（Access Manager の名前とメール）で記録する（画面が送る名前は使わない）
 - レスポンス形式：`{ ok: true, data: {...} }` / `{ ok: false, error: "UNAUTHORIZED", message?: "..." }`
 
 ## 3. 権限
@@ -113,7 +114,7 @@ GitHub Pages（画面・Google でログイン） ──ID トークン付きリ
 - 利用者か管理者かは、Access Manager の kodama の役割で決まる（役割キー `admin`＝管理者。Access Manager では「利用者／管理者」のひな形で定義する）。**GAS 側で必ず判定**（画面側は表示を変えるだけ）。権限を変えてから反映まで最大5分
 - 使えない人（付与なし・退会・未登録）は `NOT_ALLOWED`、管理者でない人の管理者操作は `ADMIN_REQUIRED`、Access Manager に問い合わせできないときは `ACCESS_UNAVAILABLE`
 - 書き込み系は GAS で `LockService` による排他制御
-- スクリプトプロパティ：`GOOGLE_CLIENT_ID`（Google ログインのクライアントID。ポータルと共通）、`ACCESS_GAS_URL`（Access Manager の GAS の URL）、`ACCESS_TOOL_ID`（Access Manager での kodama のツールID）、`ACCESS_TOOL_KEY`（Access Manager の GAS の `issueToolKeys` で出たキー）、`SPREADSHEET_ID`（スプレッドシートに紐づくスクリプトなら不要）、`OUTPUT_FOLDER_ID`（書類・告知画像の控えを残すフォルダ。省略時は控えを残さない）、`LOGO_FOLDER_ID`（団体ロゴなどの画像の保存先。一般公開しない）、`BACKUP_FOLDER_ID`（スプレッドシートの毎日のバックアップ先。省略時はバックアップしない）
+- スクリプトプロパティ：`GOOGLE_CLIENT_ID`（Google ログインのクライアントID。ポータルと共通）、`ACCESS_GAS_URL`（Access Manager の GAS の URL）、`ACCESS_TOOL_ID`（Access Manager での kodama のツールID）、`ACCESS_TOOL_KEY`（Access Manager の GAS の `issueToolKeys` で出たキー）、`SPREADSHEET_ID`（スプレッドシートに紐づくスクリプトなら不要）、`OUTPUT_FOLDER_ID`（書類・告知画像の控えを残すフォルダ。省略時は控えを残さない）、`LOGO_FOLDER_ID`（団体ロゴなどの画像の保存先。一般公開しない）、`BACKUP_FOLDER_ID`（スプレッドシートの毎日のバックアップ先。省略時はバックアップしない）、`SESSION_SECRET`（セッションの署名。自動で作る。消すと全員ログアウト。`resetAllSessions` でも可）
 
 ## 4. 画面
 
@@ -264,6 +265,7 @@ IDは GAS が自動採番（例 T001）。削除は「有効」列を FALSE。1�
 | bulkCreate | 団体の一括追加 `{ entity: 'orgs', rows: [{ values }] }` → `{ created, skipped, ignoredColumns }` | 利用者 |
 | listLogs | 操作ログ（新しい順、`limit` 既定300・最大2000） | 利用者 |
 | listTemplateRevisions | テンプレートの変更履歴 `{ templateId }` → `[{ at, actor, template }]`（新しい順・最大100） | 利用者 |
+| startSession | Google の ID トークンかポータルの引換券（`ticket`）で、7日もつセッションを出す `{ session, expiresAt, me }` | 利用者 |
 | whoami | ログインしている人（名前・メール・役割） | 利用者 |
 | verifyAdmin | 管理者か（Google ログインなら役割、以前の方式なら管理者パス） | 利用者 |
 | update | 既存行の更新（団体マスタ含む）。キー列は変更不可 | 管理者 |
@@ -381,5 +383,6 @@ IDは GAS が自動採番（例 T001）。削除は「有効」列を FALSE。1�
 16. ✅ 名称を kodama に（リポジトリ名も FSIFofficial/kodama、サイトは https://fsifofficial.github.io/kodama/ ）、媒体のコピー形式「CSV行」
 17. ✅ 自由記述 `{{自由:見出し}}`、テンプレート編集から共通パーツを作成
 18. ✅ ログインを Google に（StatiCrypt・利用者キー・管理者パスワードをやめ、使える人と管理者は FSIF の Access Manager で決める）
+19. ✅ ログインを保つ（7日のセッション）、ポータルの「開く」からログイン済みで入る（引換券）
 
 未決：画面の見た目の最終調整、本番（実際の Google ドキュメント／スライド）での書類・告知画像の出力確認

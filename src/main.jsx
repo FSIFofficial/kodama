@@ -13,10 +13,18 @@ import { Usage } from './views/Guide.jsx'
 
 const config = window.APP_CONFIG || { mock: true }
 
-// ログイン（Google。モックモードでは利用者・管理者を選ぶ）。トークンが変わったら App に知らせる
+// ログイン（Google かポータルからの引き継ぎ。モックモードでは利用者・管理者を選ぶ）。7日もつセッションを GAS からもらう。
+// ログイン状態が変わったら App に知らせる
 let onTokenChange = () => {}
-const auth = createGoogleAuth({ clientId: config.googleClientId, mock: Boolean(config.mock), onChange: (t) => onTokenChange(t) })
-const api = createApi(config, { getIdToken: () => auth.token, onAuthError: () => auth.expire() })
+let onLoginError = () => {}
+const api = createApi(config, { getToken: () => auth.token, onAuthError: () => auth.expire() })
+const auth = createGoogleAuth({
+  clientId: config.googleClientId,
+  mock: Boolean(config.mock),
+  onChange: (t) => onTokenChange(t),
+  onError: (e) => onLoginError(e),
+  startSession: (cred) => api.startSession(cred),
+})
 
 function App() {
   const [token, setToken] = useState(auth.token)
@@ -34,6 +42,7 @@ function App() {
 
   useEffect(() => {
     onTokenChange = setToken
+    onLoginError = (e) => setAuthError(e.message)
     auth.start().catch((e) => setAuthError(e.message))
   }, [])
 

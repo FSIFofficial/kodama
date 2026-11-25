@@ -4,6 +4,8 @@
  *   auth は Google ログイン（FSIF の Access Manager で権限を決める）のアダプタ。無ければ Google ログインは使えない：
  *     verifyIdToken(idToken) → { email, name }（検証できなければ例外）
  *     checkAccess(email) → { allowed, roleKey, name, reason }（Access Manager の実効権限。役割キー admin が管理者）
+ *     issueSession({ email, name }) → { session, expiresAt }（7日もつログイン。FsifSession.gs）
+ *     verifySession(session) → { email, name } / null、redeemTicket(ticket) → { email, name } / null（ポータルからの引き継ぎ）
  *   props.userKey / adminPassword は以前の「利用者キー＋管理者パスワード」方式。USER_KEY を消すと使えなくなる
  *   docs は Google ドキュメントの雛形を扱うアダプタ：readText(fileId) / render({ fileId, replacements, format, fileName })
  *   slides は Google スライドの雛形を扱うアダプタ：readText(fileId) / render({ fileId, replacements, images, fileName })
@@ -21,6 +23,7 @@ var ACTIONS = {
   bulkCreate: { fn: actionBulkCreate_, write: true },
   verifyAdmin: { fn: actionVerifyAdmin_ },
   whoami: { fn: actionWhoami_ },
+  startSession: { fn: actionStartSession_ },
   update: { fn: actionUpdate_, write: true, admin: true },
   deactivate: { fn: actionDeactivate_, write: true, admin: true },
   deleteHistory: { fn: actionDeleteHistory_, write: true, admin: true },
@@ -37,6 +40,8 @@ function handleRequest(req, env) {
     if (!req || typeof req !== 'object') return fail_('BAD_REQUEST');
     var def = ACTIONS[req.action];
     if (!def) return fail_('UNKNOWN_ACTION');
+    // 引換券（ポータルからの引き継ぎ）で入れるのはセッションを始めるときだけ
+    if (req.ticket && req.action !== 'startSession') return fail_('BAD_REQUEST');
     var user = authenticate_(req, env);
     if (user.error) return fail_(user.error, user.message);
     req.user = user;
@@ -56,14 +61,26 @@ function handleRequest(req, env) {
 
 /**
  * だれからのリクエストかを確かめる。
- * - Google ログイン（idToken）：ID トークンを検証し、Access Manager で kodama を使えるか・役割を確かめる
+ * - セッション（session）：ログインしたときに渡した署名付きの文字列（7日）。署名と期限を確かめる
+ * - Google ログイン（idToken）：ID トークンを検証する（startSession で使う。古い画面は毎回これを送る）
+ * - 引換券（ticket）：ポータルからの引き継ぎ（startSession でだけ使う）
+ * どれでも、そのあと Access Manager で kodama を使えるか・役割を確かめる
  * - 以前の方式（key）：利用者キーと照合する（USER_KEY が設定されている間だけ）
  * 返り値：{ via: 'google', email, name, role: 'admin' | 'user' } / { via: 'key' } / { error, message }
  */
 function authenticate_(req, env) {
-  if (req.idToken) {
+  if (req.session || req.idToken || req.ticket) {
     if (!env.auth) return { error: 'SERVER_NOT_CONFIGURED', message: 'Google ログインの設定（GOOGLE_CLIENT_ID・ACCESS_GAS_URL・ACCESS_TOOL_ID・ACCESS_TOOL_KEY）が GAS にありません' };
-    var who = env.auth.verifyIdToken(String(req.idToken));
+    var who;
+    if (req.session) {
+      who = env.auth.verifySession(String(req.session));
+      if (!who) return { error: 'UNAUTHORIZED', message: 'ログインの期限が切れました。ログインし直してください' };
+    } else if (req.ticket) {
+      who = env.auth.redeemTicket(String(req.ticket));
+      if (!who) return { error: 'UNAUTHORIZED', message: 'ポータルからの引き継ぎができませんでした。ログインしてください' };
+    } else {
+      who = env.auth.verifyIdToken(String(req.idToken));
+    }
     var email = String(who.email || '').toLowerCase();
     var access = env.auth.checkAccess(email);
     if (!access.allowed) {
@@ -398,6 +415,14 @@ function actionVerifyAdmin_(payload, env, req) {
 function actionWhoami_(payload, env, req) {
   var u = req.user || {};
   return u.via === 'google' ? { email: u.email, name: u.name, role: u.role } : { email: '', name: actorName_(req), role: '' };
+}
+
+// ログインを始める（Google の ID トークンかポータルの引換券で確かめたあと）。7日もつセッションを渡す
+function actionStartSession_(payload, env, req) {
+  var u = req.user || {};
+  if (u.via !== 'google') throw appError_('BAD_REQUEST', 'Google でログインしてください');
+  var s = env.auth.issueSession({ email: u.email, name: u.name });
+  return { session: s.session, expiresAt: s.expiresAt, me: { email: u.email, name: u.name, role: u.role } };
 }
 
 function actionInit_(payload, env) {

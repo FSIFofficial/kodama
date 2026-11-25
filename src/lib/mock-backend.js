@@ -1,5 +1,5 @@
 // モックモード：GAS と同じ Core.gs をブラウザ内で動かす。データはこのブラウザの localStorage のみ。
-// ログインは Google の代わりに 'mock:admin'（管理者）/ 'mock:user'（利用者）をトークンにする。
+// ログインは Google の代わりに 'mock:admin'（管理者）/ 'mock:user'（利用者）を ID トークンにし、セッション 'mocksess:…' をもらう。
 import schema from '../../gas/Schema.gs'
 import mockData from '../../gas/MockData.gs'
 import core from '../../gas/Core.gs'
@@ -25,6 +25,20 @@ function mockAuth() {
         throw e
       }
       return { email: u.email, name: u.name }
+    },
+    // セッション：'mocksess:admin' のような文字列（モックなので署名はしない）
+    issueSession({ email }) {
+      const role = Object.keys(MOCK_USERS).find((k) => MOCK_USERS[k].email === email)
+      return { session: `mocksess:${role}`, expiresAt: new Date(Date.now() + 7 * 86400000).toISOString() }
+    },
+    verifySession(session) {
+      const u = MOCK_USERS[String(session).replace(/^mocksess:/, '')]
+      return String(session).startsWith('mocksess:') && u ? { email: u.email, name: u.name } : null
+    },
+    // ポータルからの引換券の代わり：'mockticket:admin'
+    redeemTicket(ticket) {
+      const u = MOCK_USERS[String(ticket).replace(/^mockticket:/, '')]
+      return String(ticket).startsWith('mockticket:') && u ? { email: u.email, name: u.name } : null
     },
     checkAccess(email) {
       const u = byEmail[email]
