@@ -1,16 +1,17 @@
-// Google ログイン（Google Identity Services）。ID トークンを GAS に送り、GAS が検証して
-// FSIF の Access Manager で「使えるか・管理者か」を確かめる。
-// - ID トークン（約1時間で失効）はこのタブの sessionStorage にだけ置く（タブを閉じれば消える）
-// - 失効の少し前に Google の自動ログイン（prompt）で取り直す。一度ログインしたブラウザならボタンは要らない
-// - ログアウトしたら自動ログインを止める（disableAutoSelect）
-// モックモードでは Google を使わず、'mock:admin' / 'mock:user' をトークンの代わりにする。
+// ログイン。Google でログインする（またはポータルから引き継ぐ）と、GAS が7日もつセッションを出す。
+// - セッションはこのブラウザの localStorage に置く（タブを閉じても、別のタブでもログインしたまま）
+// - ポータルの「開く」から来たときは、URL の #fsif_ticket=…（引換券）でログインする（Google の画面は出ない）
+// - 使えるかどうか・管理者かは、GAS が毎回 FSIF の Access Manager に確かめる（役割を外せば最大5分で使えなくなる）
+// - ログアウトしたら自動ログインを止める（disableAutoSelect）。ポータルのログアウトとは別
+// 古い GAS（startSession が無い）のときは、以前と同じく Google の ID トークン（約1時間）をそのまま使う。
+// モックモードでは Google を使わず、'mock:admin' / 'mock:user' を ID トークンの代わりにする。
 
-const STORAGE_KEY = 'kodama-id-token'
+const STORAGE_KEY = 'kodama-session'
+const TICKET_PARAM = 'fsif_ticket'
 const GIS_SRC = 'https://accounts.google.com/gsi/client'
-const RENEW_BEFORE_MS = 5 * 60 * 1000
 const MIN_REMAINING_MS = 60 * 1000
 
-/** JWT の中身（表示と期限の確認用。検証は GAS が行う） */
+/** JWT の中身（古い GAS のときの期限の確認用。検証は GAS が行う） */
 export function decodeToken(token) {
   try {
     const part = token.split('.')[1] ?? ''
@@ -24,18 +25,34 @@ export function decodeToken(token) {
 
 function readStored() {
   try {
-    return sessionStorage.getItem(STORAGE_KEY)
+    const s = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null')
+    return s && s.token && Date.parse(s.expiresAt) - Date.now() > MIN_REMAINING_MS ? s : null
   } catch {
     return null
   }
 }
 
-function writeStored(token) {
+function writeStored(s) {
   try {
-    if (token) sessionStorage.setItem(STORAGE_KEY, token)
-    else sessionStorage.removeItem(STORAGE_KEY)
+    if (s) localStorage.setItem(STORAGE_KEY, JSON.stringify(s))
+    else localStorage.removeItem(STORAGE_KEY)
   } catch {
     // 保存できない環境では、開き直すたびにログインする
+  }
+}
+
+/** URL の #fsif_ticket=…（ポータルからの引換券）を取り出し、URL からは消す */
+export function takeTicket() {
+  try {
+    const hash = new URLSearchParams(location.hash.replace(/^#/, ''))
+    const ticket = hash.get(TICKET_PARAM)
+    if (!ticket) return ''
+    hash.delete(TICKET_PARAM)
+    const rest = hash.toString()
+    history.replaceState(null, '', location.pathname + location.search + (rest ? '#' + rest : ''))
+    return ticket
+  } catch {
+    return ''
   }
 }
 
@@ -52,33 +69,39 @@ function loadGis() {
 }
 
 /**
- * onChange(token | null) はトークンが変わるたびに呼ばれる（ログイン・取り直し・失効・ログアウト）。
- * mock が true なら Google を使わない。
+ * onChange(token | null)：ログイン状態が変わるたびに呼ばれる（ログイン・失効・ログアウト）
+ * onError(error)：ログインを始められなかったとき（使えないアカウントなど）
+ * startSession(cred)：GAS にセッションを頼む（api.startSession）。cred は { idToken } か { ticket }
  */
-export function createGoogleAuth({ clientId, mock, onChange }) {
+export function createGoogleAuth({ clientId, mock, onChange, onError, startSession }) {
   let token = null
-  let renewTimer = null
   let expiryTimer = null
   let buttonEl = null
   let ready = false
 
-  const clearTimers = () => {
-    clearTimeout(renewTimer)
+  const set = (next) => {
+    token = next ? next.token : null
+    writeStored(next)
     clearTimeout(expiryTimer)
+    if (next) expiryTimer = setTimeout(() => set(null), Math.min(Math.max(0, Date.parse(next.expiresAt) - Date.now()), 2_000_000_000))
+    onChange(token)
   }
 
-  const set = (next) => {
-    token = next
-    writeStored(next)
-    clearTimers()
-    if (next && !mock) {
-      const exp = Number(decodeToken(next).exp) * 1000
-      if (exp) {
-        renewTimer = setTimeout(() => window.google?.accounts?.id?.prompt(), Math.max(0, exp - Date.now() - RENEW_BEFORE_MS))
-        expiryTimer = setTimeout(() => set(null), Math.max(0, exp - Date.now()))
+  // Google の ID トークンか引換券で、セッションを始める
+  const begin = async (cred) => {
+    try {
+      const r = await startSession(cred)
+      if (r?.session) return set({ token: r.session, expiresAt: r.expiresAt })
+      // 古い GAS：ID トークンをそのまま使う（約1時間）
+      if (cred.idToken) {
+        const exp = Number(decodeToken(cred.idToken).exp) * 1000
+        set({ token: cred.idToken, expiresAt: new Date(exp || Date.now() + 3600_000).toISOString() })
       }
+    } catch (e) {
+      if (e.code === 'NOT_ALLOWED' && !mock) window.google?.accounts?.id?.disableAutoSelect()
+      // 引換券がだめでも、ふつうのログインで入れる。使えないアカウントのときだけ知らせる
+      if (cred.idToken || e.code === 'NOT_ALLOWED') onError?.(e)
     }
-    onChange(next)
   }
 
   const renderButton = () => {
@@ -90,18 +113,21 @@ export function createGoogleAuth({ clientId, mock, onChange }) {
     get token() {
       return token
     },
-    /** 開いたとき：保存済みのトークンがまだ十分に有効なら使い、なければ自動ログインを試す */
+    /** 開いたとき：ポータルからの引換券 → 保存済みのセッション → Google の自動ログイン の順に試す */
     async start() {
-      const stored = readStored()
-      if (stored && (mock ? stored.startsWith('mock:') : Number(decodeToken(stored).exp) * 1000 - Date.now() > MIN_REMAINING_MS)) set(stored)
-      else writeStored(null)
+      const ticket = takeTicket()
+      if (ticket) await begin({ ticket })
+      if (!token) {
+        const stored = readStored()
+        if (stored) set(stored)
+      }
       if (mock) return
       await loadGis()
       window.google.accounts.id.initialize({
         client_id: clientId,
         auto_select: true,
         use_fedcm_for_prompt: true,
-        callback: ({ credential }) => set(credential),
+        callback: ({ credential }) => void begin({ idToken: credential }),
       })
       ready = true
       renderButton()
@@ -114,13 +140,13 @@ export function createGoogleAuth({ clientId, mock, onChange }) {
     },
     /** モックモードのログイン（利用者・管理者を選ぶ） */
     mockSignIn(role) {
-      set(`mock:${role}`)
+      return begin({ idToken: `mock:${role}` })
     },
     signOut() {
       if (!mock) window.google?.accounts?.id?.disableAutoSelect()
       set(null)
     },
-    /** GAS がトークンを受け付けなかったとき（期限切れなど）。ボタンからログインし直してもらう */
+    /** GAS がセッションを受け付けなかったとき（期限切れなど）。ボタンからログインし直してもらう */
     expire() {
       set(null)
     },

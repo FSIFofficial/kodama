@@ -420,6 +420,10 @@ function setupGoogle({ legacy = false } = {}) {
       return { email: t.slice(4).toUpperCase(), name: 'Googleの名前' }
     },
     checkAccess: (email) => access[email] ?? { allowed: false, roleKey: '', name: '', reason: 'メンバー未登録' },
+    // セッション・引換券（本物は FsifSession.gs の署名付き文字列）
+    issueSession: ({ email, name }) => ({ session: `sess:${email}`, expiresAt: '2026-12-01T00:00:00.000Z', name }),
+    verifySession: (s) => (s.startsWith('sess:') && s !== 'sess:expired' ? { email: s.slice(5), name: '' } : null),
+    redeemTicket: (t) => (t.startsWith('ticket:') ? { email: t.slice(7), name: '' } : null),
   }
   if (!legacy) base.env.props = { logoFolderId: '' }
   const as = (email) => (action, payload = {}) => gas.handleRequest({ action, idToken: `tok:${email}`, payload }, base.env)
@@ -467,6 +471,33 @@ test('Google ログイン：操作ログと履歴の作成者はログインし�
   assert.equal(saved.ok, true)
   const h = user('getHistory', { id: saved.data.id }).data
   assert.equal(h.author, '利用 太郎')
+})
+
+test('セッション：Google か引換券でログインを始めると7日もつセッションが出て、以後はそれで使える', () => {
+  const { env } = setupGoogle()
+  const req = (r) => gas.handleRequest(r, env)
+  // Google の ID トークンで始める
+  const started = req({ action: 'startSession', idToken: 'tok:user@example.com' })
+  assert.equal(started.ok, true)
+  assert.equal(started.data.session, 'sess:user@example.com')
+  assert.equal(started.data.expiresAt, '2026-12-01T00:00:00.000Z')
+  assert.deepEqual(started.data.me, { email: 'user@example.com', name: '利用 太郎', role: 'user' })
+  // セッションで使える。権限は毎回 Access Manager の役割
+  assert.equal(req({ action: 'whoami', session: 'sess:admin@example.com' }).data.role, 'admin')
+  assert.equal(req({ action: 'init', session: started.data.session }).ok, true)
+  assert.equal(req({ action: 'update', session: started.data.session, payload: { entity: 'sets', key: 'S001', data: { name: 'x' } } }).error, 'ADMIN_REQUIRED')
+  // 期限切れ・改ざんはログインし直し。役割を外された人はセッションがあっても使えない
+  assert.equal(req({ action: 'init', session: 'sess:expired' }).error, 'UNAUTHORIZED')
+  assert.equal(req({ action: 'init', session: 'broken' }).error, 'UNAUTHORIZED')
+  assert.equal(req({ action: 'init', session: 'sess:gone@example.com' }).error, 'NOT_ALLOWED')
+  // ポータルからの引換券で始める。引換券はセッションを始めるときだけ使える
+  assert.equal(req({ action: 'startSession', ticket: 'ticket:admin@example.com' }).data.me.role, 'admin')
+  assert.equal(req({ action: 'startSession', ticket: 'ticket:gone@example.com' }).error, 'NOT_ALLOWED')
+  assert.equal(req({ action: 'startSession', ticket: 'bad' }).error, 'UNAUTHORIZED')
+  assert.equal(req({ action: 'init', ticket: 'ticket:admin@example.com' }).error, 'BAD_REQUEST')
+  // 以前の方式（キー）ではセッションを始められない
+  const legacy = setupGoogle({ legacy: true })
+  assert.equal(gas.handleRequest({ action: 'startSession', key: 'user-key' }, legacy.env).error, 'BAD_REQUEST')
 })
 
 test('移行期間：USER_KEY があれば、以前の方式（キー＋管理者パスワード）も使える', () => {

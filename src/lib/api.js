@@ -1,9 +1,9 @@
-// GAS クライアント。Google ログインの ID トークンを全リクエストに付ける。
+// GAS クライアント。ログインのセッション（7日。古い GAS なら Google の ID トークン）を全リクエストに付ける。
 // 使えるか・管理者かは GAS が FSIF の Access Manager に問い合わせて決める（画面側では判断しない）。
 import { createMockBackend } from './mock-backend.js'
 
 const MESSAGES = {
-  UNAUTHORIZED: 'Google のログインが切れています。ログインし直してください。',
+  UNAUTHORIZED: 'ログインの期限が切れました。ログインし直してください。',
   NOT_ALLOWED: 'このアカウントでは kodama を使えません。FSIF の Access Manager で利用を許可してもらってください。',
   ACCESS_UNAVAILABLE: '権限を確認できませんでした（Access Manager に問い合わせできませんでした）。少し待ってからもう一度お試しください。',
   ADMIN_REQUIRED: 'この操作には kodama の「管理者」の権限が必要です。FSIF の Access Manager で付けてもらってください。',
@@ -35,11 +35,17 @@ export class ApiError extends Error {
   }
 }
 
+/** セッション（GAS が出したもの）か、Google の ID トークン（古い GAS のとき）か */
+export function credentialField(token) {
+  if (!token) return {}
+  return /^(s1\.|mocksess:)/.test(token) ? { session: token } : { idToken: token }
+}
+
 /**
- * getIdToken：いまの ID トークン（無ければ空）
- * onAuthError：GAS がトークンを受け付けなかったとき（期限切れ）。ログイン画面に戻す
+ * getToken：いまのセッション（無ければ空）
+ * onAuthError：GAS がセッションを受け付けなかったとき（期限切れ）。ログイン画面に戻す
  */
-export function createApi(config, { getIdToken, onAuthError } = {}) {
+export function createApi(config, { getToken, onAuthError } = {}) {
   const mock = config.mock ? createMockBackend() : null
 
   async function send(body) {
@@ -64,7 +70,7 @@ export function createApi(config, { getIdToken, onAuthError } = {}) {
   }
 
   async function call(action, payload = {}) {
-    const res = await send({ action, idToken: getIdToken?.() || '', payload })
+    const res = await send({ action, ...credentialField(getToken?.() || ''), payload })
     if (!res || typeof res !== 'object') throw new ApiError('BAD_RESPONSE')
     if (!res.ok) {
       if (res.error === 'UNAUTHORIZED') onAuthError?.()
@@ -79,5 +85,18 @@ export function createApi(config, { getIdToken, onAuthError } = {}) {
     call,
     /** ログインしている人 { email, name, role: 'admin' | 'user' } */
     whoami: () => call('whoami'),
+    /**
+     * ログインを始める：Google の ID トークンかポータルの引換券を渡し、7日もつセッションをもらう
+     * → { session, expiresAt, me }。古い GAS（startSession が無い）なら null（ID トークンをそのまま使う）
+     */
+    async startSession(cred) {
+      const res = await send({ action: 'startSession', ...cred, payload: {} })
+      if (!res || typeof res !== 'object') throw new ApiError('BAD_RESPONSE')
+      if (!res.ok) {
+        if (res.error === 'UNKNOWN_ACTION') return null
+        throw new ApiError(res.error, res.error === 'USE_POST' ? '' : res.message)
+      }
+      return res.data
+    },
   }
 }

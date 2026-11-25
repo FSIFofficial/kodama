@@ -287,6 +287,10 @@ function createAuth_(props) {
   };
   return {
     // tokeninfo で署名・期限を確かめ、aud（クライアントID）・iss・メールの確認済みを照合する
+    // セッション・ポータルからの引き継ぎ（FsifSession.gs）
+    issueSession: fsifIssueSession_,
+    verifySession: fsifVerifySession_,
+    redeemTicket: fsifRedeemTicket_,
     verifyIdToken: function (idToken) {
       var key = 'idt:' + digest(idToken);
       var hit = cache.get(key);

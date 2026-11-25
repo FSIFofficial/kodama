@@ -130,6 +130,37 @@ test('ログイン：利用者は編集できず、管理者は編集できる�
   await app.close()
 })
 
+test('ログインを保つ：再読み込み・別のタブでもログインしたまま。ポータルの引換券で入れる', async () => {
+  const app = await open({ role: 'user' })
+  const { page } = app
+  // 再読み込みしてもログイン画面に戻らない
+  await page.reload()
+  await page.getByText('発信物を、ひとつの入力から。').waitFor()
+  // 同じブラウザの別のタブでもログインしたまま
+  const tab = await page.context().newPage()
+  await tab.goto(pageUrl)
+  await tab.getByText('発信物を、ひとつの入力から。').waitFor()
+  await tab.getByText('モック 利用者').waitFor()
+  // ログアウトしたら、別のタブも開き直すとログイン画面
+  await tab.getByRole('button', { name: 'ログアウト' }).click()
+  await page.reload()
+  await page.getByRole('button', { name: '管理者としてはじめる' }).waitFor()
+  await tab.close()
+  // ポータルからの引換券（モックでは mockticket:…）付きで開くと、ログイン画面を出さずに入れ、URL から引換券が消える
+  const portal = await page.context().newPage()
+  await portal.goto(pageUrl + '#fsif_ticket=mockticket%3Aadmin')
+  await portal.getByText('発信物を、ひとつの入力から。').waitFor()
+  await portal.getByText('モック 管理者').waitFor()
+  assert.equal(new URL(portal.url()).hash, '')
+  // 使えない引換券なら、ふつうのログイン画面
+  await portal.getByRole('button', { name: 'ログアウト' }).click()
+  await portal.goto(pageUrl + '#fsif_ticket=bad')
+  await portal.reload()
+  await portal.getByRole('button', { name: '管理者としてはじめる' }).waitFor()
+  assert.deepEqual(app.errors, [])
+  await app.close()
+})
+
 test('テンプレートの変更履歴：保存した版との差分を見て、元に戻せる', async () => {
   const app = await open()
   const { page, nav, toast } = app
